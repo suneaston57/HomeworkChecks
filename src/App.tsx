@@ -46,12 +46,17 @@ import {
   CheckSquare
 } from 'lucide-react';
 
-// --- 注入 Tailwind CSS (解決 StackBlitz 預設沒有 Tailwind 導致排版跑掉的問題) ---
-if (typeof document !== 'undefined' && !document.getElementById('tailwind-script')) {
-  const script = document.createElement('script');
-  script.id = 'tailwind-script';
-  script.src = 'https://cdn.tailwindcss.com';
-  document.head.appendChild(script);
+// --- 注入 Tailwind CSS 與修改網頁標題 ---
+if (typeof document !== 'undefined') {
+  // 自動將瀏覽器頁籤標題改為系統名稱
+  document.title = "作業點收系統";
+  
+  if (!document.getElementById('tailwind-script')) {
+    const script = document.createElement('script');
+    script.id = 'tailwind-script';
+    script.src = 'https://cdn.tailwindcss.com';
+    document.head.appendChild(script);
+  }
 }
 
 // --- 1. Firebase 設定區 ---
