@@ -43,14 +43,13 @@ import {
   Printer,
   ListChecks,
   Square,
-  CheckSquare
+  CheckSquare,
+  Ban // 新增免寫圖示
 } from 'lucide-react';
 
 // --- 注入 Tailwind CSS 與修改網頁標題 ---
 if (typeof document !== 'undefined') {
-  // 自動將瀏覽器頁籤標題改為系統名稱
   document.title = "作業點收系統";
-  
   if (!document.getElementById('tailwind-script')) {
     const script = document.createElement('script');
     script.id = 'tailwind-script';
@@ -77,7 +76,7 @@ const db = getFirestore(app);
 type ClassGroup = { id: string; name: string; };
 type Student = { id: string; number: string; classId: string; };
 type Assignment = { id: string; title: string; date: string; classId: string; };
-type StatusType = 'missing' | 'submitted' | 'correction' | 'completed';
+type StatusType = 'missing' | 'submitted' | 'correction' | 'completed' | 'exempt'; // 加入 exempt 免寫狀態
 type Submission = {
   id: string; assignmentId: string; studentId: string; studentNumber: string; status: StatusType; updatedAt?: any;
 };
@@ -88,10 +87,11 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
   missing: { label: '未繳', color: 'bg-gray-500 text-white shadow-sm', cardColor: 'bg-white', borderColor: 'border-gray-300', printColor: 'text-gray-400', icon: X },
   submitted: { label: '已繳', color: 'bg-blue-600 text-white shadow-sm', cardColor: 'bg-blue-50', borderColor: 'border-blue-400', printColor: 'text-blue-600', icon: FileText },
   correction: { label: '訂正', color: 'bg-orange-600 text-white shadow-sm', cardColor: 'bg-orange-50', borderColor: 'border-orange-400', printColor: 'text-orange-600', icon: AlertCircle },
-  completed: { label: '完成', color: 'bg-emerald-600 text-white shadow-sm', cardColor: 'bg-emerald-50', borderColor: 'border-emerald-400', printColor: 'text-emerald-600', icon: CheckCircle }
+  completed: { label: '完成', color: 'bg-emerald-600 text-white shadow-sm', cardColor: 'bg-emerald-50', borderColor: 'border-emerald-400', printColor: 'text-emerald-600', icon: CheckCircle },
+  exempt: { label: '免寫', color: 'bg-gray-300 text-gray-700 shadow-sm', cardColor: 'bg-gray-100', borderColor: 'border-gray-300', printColor: 'text-gray-500', icon: Ban }
 };
 
-const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
+const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
 
 const downloadCSV = (content: string, filename: string) => {
   const bom = '\uFEFF';
@@ -166,7 +166,6 @@ export default function App() {
     const unsubStudents = onSnapshot(query(collection(db, 'students'), where('classId', '==', selectedClassId)), (snap) => {
       const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Student)).sort((a, b) => parseInt(a.number) - parseInt(b.number));
       setStudents(list);
-      if (list.length > 0 && !selectedStudentId) setSelectedStudentId(list[0].id);
     }, handleSnapshotError);
 
     const unsubAssignments = onSnapshot(query(collection(db, 'assignments'), where('classId', '==', selectedClassId)), (snap) => {
@@ -184,6 +183,36 @@ export default function App() {
     return () => { unsubStudents(); unsubAssignments(); unsubSubmissions(); };
   }, [user, selectedClassId]);
 
+  // --- 關鍵優化：歷史紀錄與現役學生合併邏輯 ---
+  const allHistoricalStudents = useMemo(() => {
+    const map = new Map();
+    // 1. 先加入目前的現役學生
+    students.forEach(s => map.set(s.id, { ...s, isActive: true }));
+    
+    // 2. 尋找曾經交過作業的學生 (被誤刪或休學的)
+    const classAssignmentIds = new Set(assignments.map(a => a.id));
+    Object.values(submissions).forEach(sub => {
+        if (classAssignmentIds.has(sub.assignmentId)) {
+            if (!map.has(sub.studentId) && sub.studentId) {
+                map.set(sub.studentId, {
+                    id: sub.studentId,
+                    number: sub.studentNumber,
+                    isActive: false // 標記為非現役/歷史
+                });
+            }
+        }
+    });
+    return Array.from(map.values()).sort((a, b) => parseInt(a.number) - parseInt(b.number));
+  }, [students, submissions, assignments]);
+
+  // 若尚未選擇學生，自動選擇合併後名單的第一位
+  useEffect(() => {
+    if (allHistoricalStudents.length > 0 && !selectedStudentId) {
+        setSelectedStudentId(allHistoricalStudents[0].id);
+    }
+  }, [allHistoricalStudents, selectedStudentId]);
+
+  // --- Derived Data ---
   const filteredAssignments = useMemo(() => assignments.filter(a => a.title.toLowerCase().includes(assignmentSearchTerm.toLowerCase()) || a.date.includes(assignmentSearchTerm)), [assignments, assignmentSearchTerm]);
 
   useEffect(() => {
@@ -196,17 +225,10 @@ export default function App() {
   }, [submissions, selectedAssignmentId]);
 
   const currentAssignmentStats = useMemo(() => {
-    const stats = { completed: 0, correction: 0, submitted: 0, missing: 0 };
+    const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0 };
     currentAssignmentSubmissions.forEach(s => { stats[s.status]++; });
     return stats;
   }, [currentAssignmentSubmissions]);
-
-  const getAssignmentCompletion = (assignId: string) => {
-      const subs = Object.values(submissions).filter(s => s.assignmentId === assignId);
-      if (subs.length === 0) return { completed: 0, total: 0, isDone: false };
-      const completed = subs.filter(s => s.status === 'completed').length;
-      return { completed, total: subs.length, isDone: completed === subs.length };
-  };
 
   // --- Core Action: Cycle Status ---
   const handleCycleStatus = async (sub: Submission) => {
@@ -240,8 +262,8 @@ export default function App() {
     if (exportSelectedAssignments.size === 0) return showNotification("請至少選擇一項作業", "info");
     const selectedAssigns = assignments.filter(a => exportSelectedAssignments.has(a.id)).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
     let csvContent = "座號" + selectedAssigns.map(a => `,${a.date} ${a.title}`).join('') + "\n";
-    students.forEach(student => {
-        csvContent += `${student.number}` + selectedAssigns.map(a => {
+    allHistoricalStudents.forEach(student => {
+        csvContent += `${student.number}${student.isActive ? '' : '(歷史)'}` + selectedAssigns.map(a => {
             const sub = submissions[`${a.id}_${student.id}`];
             return `,${sub ? STATUS_CONFIG[sub.status].label : '無紀錄'}`;
         }).join('') + "\n";
@@ -293,6 +315,7 @@ export default function App() {
       const batch = writeBatch(db);
       const assignRef = doc(collection(db, 'assignments'));
       batch.set(assignRef, { title: newAssignmentTitle, date: newAssignmentDate, classId: selectedClassId, createdAt: serverTimestamp() });
+      // 注意：新增作業時，只會產生「現役學生(students)」的缺交紀錄
       students.forEach(student => {
           const subId = `${assignRef.id}_${student.id}`;
           batch.set(doc(db, 'submissions', subId), { id: subId, assignmentId: assignRef.id, studentId: student.id, studentNumber: student.number, status: 'missing', updatedAt: serverTimestamp() });
@@ -322,6 +345,23 @@ export default function App() {
   const deleteStudent = async (id: string) => { try { await deleteDoc(doc(db, 'students', id)); showNotification('座號已刪除', 'success'); } catch (err: any) { } }
 
   // --- Render Helpers ---
+  const StatusBadge = ({ status, isMobile }: { status: StatusType, isMobile?: boolean }) => {
+    const config = STATUS_CONFIG[status];
+    const Icon = config.icon;
+    if (isMobile) {
+      return (
+        <div className={`flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-lg font-bold border-2 transition-all w-full shadow-sm ${config.color}`}>
+          <Icon size={22} strokeWidth={2.5} /> {config.label}
+        </div>
+      );
+    }
+    return (
+      <div className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border transition-all ${config.color}`}>
+        <Icon size={12} strokeWidth={2.5} /> {config.label}
+      </div>
+    );
+  };
+
   const StatusSelector = ({ currentStatus, onSelect }: { currentStatus: StatusType, onSelect: (s: StatusType) => void }) => (
     <div className="flex bg-gray-100 p-1 rounded-lg gap-1 w-full print:hidden">
       {STATUS_ORDER.map(status => {
@@ -357,6 +397,8 @@ export default function App() {
   }
 
   if (isLoading && classes.length === 0) return <div className="flex h-screen items-center justify-center bg-gray-50"><RefreshCw className="animate-spin text-indigo-600 w-8 h-8"/></div>;
+
+  const selectedExportAssignsSorted = assignments.filter(a => exportSelectedAssignments.has(a.id)).sort((a,b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans pb-10 print:bg-white print:p-0">
@@ -396,7 +438,7 @@ export default function App() {
 
       <main className="max-w-6xl mx-auto px-2 sm:px-4 lg:px-6 py-4 print:p-0 print:max-w-none">
         
-        {/* VIEW 1: BY ASSIGNMENT (已優化：緊湊網格排列，一排5個) */}
+        {/* VIEW 1: BY ASSIGNMENT */}
         {activeTab === 'by-assignment' && selectedClassId && (
             <div className="space-y-4">
                 <div className="bg-white p-3 rounded-xl shadow-sm border border-gray-100 flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center print:hidden">
@@ -416,39 +458,18 @@ export default function App() {
                         </div>
                     </div>
                     {assignments.length > 0 && (
-                        <div className="grid grid-cols-4 gap-1 text-center divide-x divide-gray-100 bg-gray-50 p-1.5 rounded-lg border border-gray-200 flex-shrink-0 w-full sm:w-auto">
-                            <div className="px-3"><div className="text-lg font-bold text-green-600 leading-tight">{currentAssignmentStats.completed}</div><div className="text-[10px] text-gray-500">完成</div></div>
-                            <div className="px-3"><div className="text-lg font-bold text-orange-500 leading-tight">{currentAssignmentStats.correction}</div><div className="text-[10px] text-gray-500">訂正</div></div>
-                            <div className="px-3"><div className="text-lg font-bold text-blue-500 leading-tight">{currentAssignmentStats.submitted}</div><div className="text-[10px] text-gray-500">已繳</div></div>
-                            <div className="px-3"><div className="text-lg font-bold text-gray-400 leading-tight">{currentAssignmentStats.missing}</div><div className="text-[10px] text-gray-500">未繳</div></div>
+                        <div className="grid grid-cols-5 gap-1 text-center divide-x divide-gray-100 bg-gray-50 p-1.5 rounded-lg border border-gray-200 flex-shrink-0 w-full sm:w-auto">
+                            <div className="px-2"><div className="text-lg font-bold text-green-600 leading-tight">{currentAssignmentStats.completed}</div><div className="text-[10px] text-gray-500">完成</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-orange-500 leading-tight">{currentAssignmentStats.correction}</div><div className="text-[10px] text-gray-500">訂正</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-blue-500 leading-tight">{currentAssignmentStats.submitted}</div><div className="text-[10px] text-gray-500">已繳</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-gray-600 leading-tight">{currentAssignmentStats.exempt}</div><div className="text-[10px] text-gray-500">免寫</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-gray-400 leading-tight">{currentAssignmentStats.missing}</div><div className="text-[10px] text-gray-500">未繳</div></div>
                         </div>
                     )}
                 </div>
 
                 {selectedAssignmentId && assignments.length > 0 ? (
                     <>
-                        {/* 桌面/平板 Grid (優化：強制 5 欄，縮小間距與高度) */}
-                        <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
-                            {currentAssignmentSubmissions.map(sub => {
-                                const config = STATUS_CONFIG[sub.status];
-                                return (
-                                <div 
-                                    key={sub.id} 
-                                    onClick={() => handleCycleStatus(sub)}
-                                    // 縮小 p-2, py-2.5 以減少高度
-                                    className={`px-3 py-2 rounded-lg shadow-sm flex justify-between items-center border-2 transition-all cursor-pointer hover:shadow-md active:scale-95 select-none ${config.cardColor} ${config.borderColor}`}
-                                >
-                                    <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
-                                    {/* 縮小標籤內的 padding 和字體 */}
-                                    <span className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-bold border shadow-sm ${config.color}`}>
-                                        <config.icon size={12} strokeWidth={2.5} />
-                                        <span className="hidden lg:inline">{config.label}</span>
-                                    </span>
-                                </div>
-                            )})}
-                        </div>
-
-                        {/* 手機版依然維持清單以確保可讀性，但稍微縮小高度 */}
                         <div className="block sm:hidden bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden print:hidden">
                              <table className="w-full text-sm text-left">
                                 <thead className="bg-gray-50 text-gray-500 font-medium"><tr><th className="px-4 py-2 w-16">座號</th><th className="px-4 py-2 text-right">狀態 (點擊切換)</th></tr></thead>
@@ -463,28 +484,41 @@ export default function App() {
                                             {sub.studentNumber}
                                         </td>
                                         <td className="px-4 py-3 text-right">
-                                            <span className={`inline-flex items-center justify-center gap-1 px-3 py-1 rounded-md text-sm font-bold border-2 shadow-sm ${config.color}`}>
-                                                <config.icon size={16} strokeWidth={2.5}/> {config.label}
-                                            </span>
+                                            <StatusBadge status={sub.status} isMobile={true} />
                                         </td>
                                     </tr>
                                 )})}
                                 </tbody>
                              </table>
                         </div>
+                        
+                        <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
+                            {currentAssignmentSubmissions.map(sub => {
+                                const config = STATUS_CONFIG[sub.status];
+                                return (
+                                <div 
+                                    key={sub.id} 
+                                    onClick={() => handleCycleStatus(sub)}
+                                    className={`px-3 py-2 rounded-lg shadow-sm flex justify-between items-center border-2 transition-all cursor-pointer hover:shadow-md active:scale-95 select-none ${config.cardColor} ${config.borderColor}`}
+                                >
+                                    <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
+                                    <StatusBadge status={sub.status} />
+                                </div>
+                            )})}
+                        </div>
                     </>
                 ) : <div className="text-center py-12 text-gray-400 border border-dashed rounded-xl print:hidden">請選擇作業</div>}
             </div>
         )}
 
-        {/* VIEW 2: BY STUDENT */}
+        {/* VIEW 2: BY STUDENT (已優化：使用全歷史名單，不會漏掉任何人) */}
         {activeTab === 'by-student' && selectedClassId && (
              <div className="space-y-6">
                 <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 print:hidden">
                     <label className="block text-xs font-semibold text-gray-500 mb-1">選擇座號</label>
                     <select value={selectedStudentId} onChange={(e) => setSelectedStudentId(e.target.value)} className="w-full sm:w-64 p-2 bg-gray-50 border border-gray-200 rounded-lg outline-none">
-                        {students.length === 0 && <option>尚無學生</option>}
-                        {students.map(s => <option key={s.id} value={s.id}>{s.number} 號</option>)}
+                        {allHistoricalStudents.length === 0 && <option>尚無學生</option>}
+                        {allHistoricalStudents.map(s => <option key={s.id} value={s.id}>{s.number} 號 {s.isActive ? '' : '(歷史紀錄)'}</option>)}
                     </select>
                 </div>
                 {selectedStudentId && (
@@ -511,7 +545,7 @@ export default function App() {
              </div>
         )}
 
-        {/* VIEW 3: BATCH EXPORT */}
+        {/* VIEW 3: BATCH EXPORT (已優化：使用全歷史名單) */}
         {activeTab === 'export' && selectedClassId && (
             <div className="space-y-6">
                 <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 print:hidden">
@@ -547,23 +581,35 @@ export default function App() {
                         <thead>
                             <tr className="bg-gray-100">
                                 <th className="border border-gray-300 p-2 w-16">座號</th>
-                                {assignments.filter(a => exportSelectedAssignments.has(a.id)).sort((a,b) => new Date(a.date).getTime() - new Date(b.date).getTime()).map(a => (
+                                {selectedExportAssignsSorted.map(a => (
                                     <th key={a.id} className="border border-gray-300 p-2"><div className="text-xs text-gray-500">{a.date}</div><div>{a.title}</div></th>
                                 ))}
                             </tr>
                         </thead>
                         <tbody>
-                            {students.map(student => (
+                            {allHistoricalStudents.map(student => (
                                 <tr key={student.id}>
-                                    <td className="border border-gray-300 p-2 font-bold">{student.number}</td>
-                                    {assignments.filter(a => exportSelectedAssignments.has(a.id)).sort((a,b) => new Date(a.date).getTime() - new Date(b.date).getTime()).map(a => {
+                                    <td className="border border-gray-300 p-2 font-bold text-gray-700">
+                                        {student.number}
+                                        {!student.isActive && <span className="text-[10px] text-red-500 block font-normal leading-none mt-1">歷史</span>}
+                                    </td>
+                                    {selectedExportAssignsSorted.map(a => {
                                         const sub = submissions[`${a.id}_${student.id}`];
-                                        return <td key={a.id} className={`border border-gray-300 p-2 font-bold ${sub ? STATUS_CONFIG[sub.status].printColor : ''}`}>{sub?.status === 'completed' ? 'O' : sub?.status === 'correction' ? '△' : sub?.status === 'submitted' ? 'V' : ''}</td>;
+                                        const simpleLabel = sub?.status === 'completed' ? 'O' : sub?.status === 'correction' ? '△' : sub?.status === 'submitted' ? 'V' : sub?.status === 'exempt' ? '-' : '';
+                                        return <td key={a.id} className={`border border-gray-300 p-2 font-bold ${sub ? STATUS_CONFIG[sub.status].printColor : ''}`}>{simpleLabel}</td>;
                                     })}
                                 </tr>
                             ))}
                         </tbody>
                     </table>
+                    <div className="mt-4 text-xs text-gray-500 flex gap-4">
+                        <span>圖例說明：</span>
+                        <span>O = 完成</span>
+                        <span>△ = 訂正</span>
+                        <span>V = 已繳</span>
+                        <span>- = 免寫</span>
+                        <span>(空) = 未繳 / 無紀錄</span>
+                    </div>
                 </div>
             </div>
         )}
