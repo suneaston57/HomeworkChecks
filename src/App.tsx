@@ -92,7 +92,6 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
 };
 
 const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
-// 獨立出一個純淨的 4 階段循環，讓點擊卡片時不會被免寫卡住
 const CYCLE_STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
 
 const downloadCSV = (content: string, filename: string) => {
@@ -231,38 +230,28 @@ export default function App() {
     return stats;
   }, [currentAssignmentSubmissions]);
 
-  // 安全取得進度
-  const getAssignmentCompletion = (assignId: string) => {
-      const subs = Object.values(submissions).filter(s => s.assignmentId === assignId);
-      if (subs.length === 0) return { completed: 0, total: 0, isDone: false };
-      const completed = subs.filter(s => s.status === 'completed').length;
-      const exempt = subs.filter(s => s.status === 'exempt').length;
-      return { completed, total: subs.length, isDone: (completed + exempt) === subs.length };
-  };
-
   // --- Core Action: Cycle Status ---
   const handleCycleStatus = async (sub: Submission) => {
     if (!user) return;
     
-    let newStatus: StatusType;
+    // 【重要優化】如果是免寫狀態，直接鎖定卡片點擊，不執行狀態切換
     if (sub.status === 'exempt') {
-        // 如果目前是免寫，點擊後回到未繳
-        newStatus = 'missing';
-    } else {
-        // 只在 4 個主要狀態間循環，忽略免寫
-        const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
-        const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
-        newStatus = CYCLE_STATUS_ORDER[nextIndex];
+        return; 
     }
+
+    // 只在 4 個主要狀態間循環
+    const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
+    const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
+    const newStatus = CYCLE_STATUS_ORDER[nextIndex];
 
     try {
         await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
     } catch (err: any) { handleSnapshotError(err); }
   };
 
-  // 獨立的切換免寫功能
+  // 獨立的切換免寫功能 (解鎖/上鎖)
   const toggleExemptStatus = async (sub: Submission, e: React.MouseEvent) => {
-    e.stopPropagation(); // 阻止事件冒泡，避免觸發上方卡片的點擊循環
+    e.stopPropagation(); // 阻止事件冒泡，確保不會觸發上方卡片的點擊
     if (!user) return;
     const newStatus = sub.status === 'exempt' ? 'missing' : 'exempt';
     try {
@@ -512,8 +501,15 @@ export default function App() {
                                 {currentAssignmentSubmissions?.map(sub => {
                                     const config = STATUS_CONFIG[sub.status];
                                     const borderColor = config.borderColor.replace('border-', 'bg-');
+                                    // 判斷是否被免寫鎖定
+                                    const isExempt = sub.status === 'exempt';
+                                    
                                     return (
-                                    <tr key={sub.id} onClick={() => handleCycleStatus(sub)} className="hover:bg-gray-50 active:bg-gray-100 relative cursor-pointer select-none transition-colors">
+                                    <tr 
+                                        key={sub.id} 
+                                        onClick={() => handleCycleStatus(sub)} 
+                                        className={`relative select-none transition-colors ${isExempt ? 'bg-gray-100 opacity-80' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
+                                    >
                                         <td className="relative px-4 py-3 font-mono text-xl font-bold text-gray-700">
                                             <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${borderColor}`}></div>
                                             {sub.studentNumber}
@@ -523,12 +519,12 @@ export default function App() {
                                                 {/* 獨立免寫按鈕 */}
                                                 <button 
                                                     onClick={(e) => toggleExemptStatus(sub, e)}
-                                                    className={`p-2.5 rounded-xl border-2 transition-all ${sub.status === 'exempt' ? 'bg-gray-200 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
-                                                    title="切換免寫"
+                                                    className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-gray-200 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
+                                                    title="切換免寫鎖定"
                                                 >
                                                     <Ban size={22} strokeWidth={2.5}/>
                                                 </button>
-                                                {/* 原有的狀態標籤，設為 pointer-events-none 讓點擊穿透到 tr */}
+                                                {/* 狀態標籤 */}
                                                 <div className="flex-1 pointer-events-none">
                                                     <StatusBadge status={sub.status} isMobile={true} />
                                                 </div>
@@ -544,11 +540,13 @@ export default function App() {
                         <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
                             {currentAssignmentSubmissions?.map(sub => {
                                 const config = STATUS_CONFIG[sub.status];
+                                const isExempt = sub.status === 'exempt';
+                                
                                 return (
                                 <div 
                                     key={sub.id} 
                                     onClick={() => handleCycleStatus(sub)}
-                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all cursor-pointer hover:shadow-md active:scale-95 select-none ${config.cardColor} ${config.borderColor}`}
+                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all select-none ${config.cardColor} ${config.borderColor} ${isExempt ? 'opacity-80' : 'cursor-pointer hover:shadow-md active:scale-95'}`}
                                 >
                                     <div className="flex justify-between items-center w-full">
                                         <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
@@ -556,12 +554,14 @@ export default function App() {
                                             {/* 獨立免寫按鈕 */}
                                             <button 
                                                 onClick={(e) => toggleExemptStatus(sub, e)}
-                                                className={`p-1.5 rounded-md border transition-all ${sub.status === 'exempt' ? 'bg-gray-300 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
-                                                title="切換免寫"
+                                                className={`p-1.5 rounded-md border transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-gray-300 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
+                                                title="切換免寫鎖定"
                                             >
                                                 <Ban size={14} strokeWidth={3}/>
                                             </button>
-                                            <StatusBadge status={sub.status} />
+                                            <div className="pointer-events-none">
+                                                <StatusBadge status={sub.status} />
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
