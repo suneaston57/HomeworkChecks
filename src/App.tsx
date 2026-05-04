@@ -44,7 +44,7 @@ import {
   ListChecks,
   Square,
   CheckSquare,
-  Ban // 新增免寫圖示
+  Ban
 } from 'lucide-react';
 
 // --- 注入 Tailwind CSS 與修改網頁標題 ---
@@ -76,7 +76,7 @@ const db = getFirestore(app);
 type ClassGroup = { id: string; name: string; };
 type Student = { id: string; number: string; classId: string; };
 type Assignment = { id: string; title: string; date: string; classId: string; };
-type StatusType = 'missing' | 'submitted' | 'correction' | 'completed' | 'exempt'; // 加入 exempt 免寫狀態
+type StatusType = 'missing' | 'submitted' | 'correction' | 'completed' | 'exempt';
 type Submission = {
   id: string; assignmentId: string; studentId: string; studentNumber: string; status: StatusType; updatedAt?: any;
 };
@@ -92,6 +92,8 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
 };
 
 const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
+// 獨立出一個純淨的 4 階段循環，讓點擊卡片時不會被免寫卡住
+const CYCLE_STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
 
 const downloadCSV = (content: string, filename: string) => {
   const bom = '\uFEFF';
@@ -127,8 +129,8 @@ export default function App() {
   const [exportSelectedAssignments, setExportSelectedAssignments] = useState<Set<string>>(new Set());
 
   const [newClassName, setNewClassName] = useState('');
-  const [startNumber, setStartNumber] = useState(1);
-  const [endNumber, setEndNumber] = useState(30);
+  const [startNumber, setStartNumber] = useState<number | ''>(1);
+  const [endNumber, setEndNumber] = useState<number | ''>(30);
   const [newAssignmentTitle, setNewAssignmentTitle] = useState('');
   const [newAssignmentDate, setNewAssignmentDate] = useState(new Date().toISOString().split('T')[0]);
 
@@ -164,7 +166,7 @@ export default function App() {
     if (!user || !selectedClassId) { setStudents([]); setAssignments([]); return; }
     
     const unsubStudents = onSnapshot(query(collection(db, 'students'), where('classId', '==', selectedClassId)), (snap) => {
-      const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Student)).sort((a, b) => parseInt(a.number) - parseInt(b.number));
+      const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Student)).sort((a, b) => parseInt(a.number || '0') - parseInt(b.number || '0'));
       setStudents(list);
     }, handleSnapshotError);
 
@@ -183,13 +185,11 @@ export default function App() {
     return () => { unsubStudents(); unsubAssignments(); unsubSubmissions(); };
   }, [user, selectedClassId]);
 
-  // --- 關鍵優化：歷史紀錄與現役學生合併邏輯 ---
+  // --- 歷史紀錄與現役學生合併邏輯 ---
   const allHistoricalStudents = useMemo(() => {
     const map = new Map();
-    // 1. 先加入目前的現役學生
     students.forEach(s => map.set(s.id, { ...s, isActive: true }));
     
-    // 2. 尋找曾經交過作業的學生 (被誤刪或休學的)
     const classAssignmentIds = new Set(assignments.map(a => a.id));
     Object.values(submissions).forEach(sub => {
         if (classAssignmentIds.has(sub.assignmentId)) {
@@ -197,15 +197,14 @@ export default function App() {
                 map.set(sub.studentId, {
                     id: sub.studentId,
                     number: sub.studentNumber,
-                    isActive: false // 標記為非現役/歷史
+                    isActive: false 
                 });
             }
         }
     });
-    return Array.from(map.values()).sort((a, b) => parseInt(a.number) - parseInt(b.number));
+    return Array.from(map.values()).sort((a, b) => parseInt(a.number || '0') - parseInt(b.number || '0'));
   }, [students, submissions, assignments]);
 
-  // 若尚未選擇學生，自動選擇合併後名單的第一位
   useEffect(() => {
     if (allHistoricalStudents.length > 0 && !selectedStudentId) {
         setSelectedStudentId(allHistoricalStudents[0].id);
@@ -221,21 +220,51 @@ export default function App() {
 
   const currentAssignmentSubmissions = useMemo(() => {
       if (!selectedAssignmentId) return [];
-      return Object.values(submissions).filter(s => s.assignmentId === selectedAssignmentId).sort((a, b) => parseInt(a.studentNumber) - parseInt(b.studentNumber));
+      return Object.values(submissions).filter(s => s.assignmentId === selectedAssignmentId).sort((a, b) => parseInt(a.studentNumber || '0') - parseInt(b.studentNumber || '0'));
   }, [submissions, selectedAssignmentId]);
 
   const currentAssignmentStats = useMemo(() => {
     const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0 };
-    currentAssignmentSubmissions.forEach(s => { stats[s.status]++; });
+    currentAssignmentSubmissions.forEach(s => { 
+        if (stats[s.status] !== undefined) stats[s.status]++; 
+    });
     return stats;
   }, [currentAssignmentSubmissions]);
+
+  // 安全取得進度
+  const getAssignmentCompletion = (assignId: string) => {
+      const subs = Object.values(submissions).filter(s => s.assignmentId === assignId);
+      if (subs.length === 0) return { completed: 0, total: 0, isDone: false };
+      const completed = subs.filter(s => s.status === 'completed').length;
+      const exempt = subs.filter(s => s.status === 'exempt').length;
+      return { completed, total: subs.length, isDone: (completed + exempt) === subs.length };
+  };
 
   // --- Core Action: Cycle Status ---
   const handleCycleStatus = async (sub: Submission) => {
     if (!user) return;
-    const currentIndex = STATUS_ORDER.indexOf(sub.status);
-    const nextIndex = (currentIndex + 1) % STATUS_ORDER.length;
-    const newStatus = STATUS_ORDER[nextIndex];
+    
+    let newStatus: StatusType;
+    if (sub.status === 'exempt') {
+        // 如果目前是免寫，點擊後回到未繳
+        newStatus = 'missing';
+    } else {
+        // 只在 4 個主要狀態間循環，忽略免寫
+        const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
+        const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
+        newStatus = CYCLE_STATUS_ORDER[nextIndex];
+    }
+
+    try {
+        await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
+    } catch (err: any) { handleSnapshotError(err); }
+  };
+
+  // 獨立的切換免寫功能
+  const toggleExemptStatus = async (sub: Submission, e: React.MouseEvent) => {
+    e.stopPropagation(); // 阻止事件冒泡，避免觸發上方卡片的點擊循環
+    if (!user) return;
+    const newStatus = sub.status === 'exempt' ? 'missing' : 'exempt';
     try {
         await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
     } catch (err: any) { handleSnapshotError(err); }
@@ -268,7 +297,7 @@ export default function App() {
             return `,${sub ? STATUS_CONFIG[sub.status].label : '無紀錄'}`;
         }).join('') + "\n";
     });
-    downloadCSV(csvContent, `${classes.find(c => c.id === selectedClassId)?.name}_作業繳交總表.csv`);
+    downloadCSV(csvContent, `${classes.find(c => c.id === selectedClassId)?.name || '未命名'}_作業繳交總表.csv`);
     showNotification("總表已匯出", "success");
   };
 
@@ -291,12 +320,12 @@ export default function App() {
 
   const handleBatchCreateStudents = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !selectedClassId || startNumber > endNumber) return;
+    if (!user || !selectedClassId || startNumber === '' || endNumber === '' || startNumber > endNumber) return;
     setIsLoading(true);
     const batch = writeBatch(db);
     const existingNumbers = new Set((await getDocs(query(collection(db, 'students'), where('classId', '==', selectedClassId)))).docs.map(d => parseInt(d.data().number)));
     let count = 0;
-    for (let i = startNumber; i <= endNumber; i++) {
+    for (let i = startNumber as number; i <= (endNumber as number); i++) {
         if (!existingNumbers.has(i)) {
             batch.set(doc(collection(db, 'students')), { number: i.toString().padStart(2, '0'), classId: selectedClassId, createdAt: serverTimestamp() });
             count++;
@@ -315,7 +344,6 @@ export default function App() {
       const batch = writeBatch(db);
       const assignRef = doc(collection(db, 'assignments'));
       batch.set(assignRef, { title: newAssignmentTitle, date: newAssignmentDate, classId: selectedClassId, createdAt: serverTimestamp() });
-      // 注意：新增作業時，只會產生「現役學生(students)」的缺交紀錄
       students.forEach(student => {
           const subId = `${assignRef.id}_${student.id}`;
           batch.set(doc(db, 'submissions', subId), { id: subId, assignmentId: assignRef.id, studentId: student.id, studentNumber: student.number, status: 'missing', updatedAt: serverTimestamp() });
@@ -341,8 +369,14 @@ export default function App() {
       finally { setIsLoading(false); }
   };
 
-  const deleteAssignment = async (id: string) => { try { await deleteDoc(doc(db, 'assignments', id)); showNotification('作業已刪除', 'success'); } catch (err: any) { } }
-  const deleteStudent = async (id: string) => { try { await deleteDoc(doc(db, 'students', id)); showNotification('座號已刪除', 'success'); } catch (err: any) { } }
+  const deleteAssignment = async (id: string) => { 
+      try { await deleteDoc(doc(db, 'assignments', id)); showNotification('作業已刪除', 'success'); } 
+      catch (err: any) { console.error(err); showNotification('刪除失敗', 'error'); } 
+  };
+  const deleteStudent = async (id: string) => { 
+      try { await deleteDoc(doc(db, 'students', id)); showNotification('座號已刪除', 'success'); } 
+      catch (err: any) { console.error(err); showNotification('刪除失敗', 'error'); } 
+  };
 
   // --- Render Helpers ---
   const StatusBadge = ({ status, isMobile }: { status: StatusType, isMobile?: boolean }) => {
@@ -415,7 +449,7 @@ export default function App() {
               <div className="relative group">
                 <select value={selectedClassId} onChange={(e) => setSelectedClassId(e.target.value)} className="appearance-none bg-indigo-50 border border-indigo-100 text-indigo-700 py-1 pl-3 pr-8 rounded-lg text-sm font-bold focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer hover:bg-indigo-100 transition-colors">
                   <option value="" disabled>請選擇班級</option>
-                  {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  {classes?.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
                 <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-indigo-500 pointer-events-none"/>
               </div>
@@ -432,7 +466,7 @@ export default function App() {
       </header>
 
       <div className="hidden print:block text-center mb-6 pt-4">
-        <h1 className="text-2xl font-bold text-gray-900 mb-1">{classes.find(c => c.id === selectedClassId)?.name} 作業繳交總表</h1>
+        <h1 className="text-2xl font-bold text-gray-900 mb-1">{classes.find(c => c.id === selectedClassId)?.name || '未命名'} 作業繳交總表</h1>
         <p className="text-sm text-gray-500">列印日期：{new Date().toLocaleDateString()}</p>
       </div>
 
@@ -451,7 +485,7 @@ export default function App() {
                             <div className="flex gap-2 flex-1">
                                 <select value={selectedAssignmentId} onChange={(e) => setSelectedAssignmentId(e.target.value)} className="flex-grow py-1.5 pl-2 pr-8 bg-white border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none text-ellipsis overflow-hidden">
                                     {assignments.length === 0 && <option>尚無作業</option>}
-                                    {filteredAssignments.map(a => <option key={a.id} value={a.id}>{a.date} - {a.title}</option>)}
+                                    {filteredAssignments?.map(a => <option key={a.id} value={a.id}>{a.date} - {a.title}</option>)}
                                 </select>
                                 {selectedAssignmentId && <button onClick={() => syncStudentsToAssignment(selectedAssignmentId)} className="bg-indigo-50 text-indigo-600 px-2.5 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors flex-shrink-0" title="同步名單"><UserPlus size={16}/></button>}
                             </div>
@@ -470,11 +504,12 @@ export default function App() {
 
                 {selectedAssignmentId && assignments.length > 0 ? (
                     <>
+                        {/* 手機版：增加獨立免寫按鈕 */}
                         <div className="block sm:hidden bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden print:hidden">
                              <table className="w-full text-sm text-left">
                                 <thead className="bg-gray-50 text-gray-500 font-medium"><tr><th className="px-4 py-2 w-16">座號</th><th className="px-4 py-2 text-right">狀態 (點擊切換)</th></tr></thead>
                                 <tbody className="divide-y divide-gray-100">
-                                {currentAssignmentSubmissions.map(sub => {
+                                {currentAssignmentSubmissions?.map(sub => {
                                     const config = STATUS_CONFIG[sub.status];
                                     const borderColor = config.borderColor.replace('border-', 'bg-');
                                     return (
@@ -484,7 +519,20 @@ export default function App() {
                                             {sub.studentNumber}
                                         </td>
                                         <td className="px-4 py-3 text-right">
-                                            <StatusBadge status={sub.status} isMobile={true} />
+                                            <div className="flex justify-end items-center gap-2">
+                                                {/* 獨立免寫按鈕 */}
+                                                <button 
+                                                    onClick={(e) => toggleExemptStatus(sub, e)}
+                                                    className={`p-2.5 rounded-xl border-2 transition-all ${sub.status === 'exempt' ? 'bg-gray-200 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
+                                                    title="切換免寫"
+                                                >
+                                                    <Ban size={22} strokeWidth={2.5}/>
+                                                </button>
+                                                {/* 原有的狀態標籤，設為 pointer-events-none 讓點擊穿透到 tr */}
+                                                <div className="flex-1 pointer-events-none">
+                                                    <StatusBadge status={sub.status} isMobile={true} />
+                                                </div>
+                                            </div>
                                         </td>
                                     </tr>
                                 )})}
@@ -492,17 +540,30 @@ export default function App() {
                              </table>
                         </div>
                         
+                        {/* 桌面/平板版：增加獨立免寫小按鈕 */}
                         <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
-                            {currentAssignmentSubmissions.map(sub => {
+                            {currentAssignmentSubmissions?.map(sub => {
                                 const config = STATUS_CONFIG[sub.status];
                                 return (
                                 <div 
                                     key={sub.id} 
                                     onClick={() => handleCycleStatus(sub)}
-                                    className={`px-3 py-2 rounded-lg shadow-sm flex justify-between items-center border-2 transition-all cursor-pointer hover:shadow-md active:scale-95 select-none ${config.cardColor} ${config.borderColor}`}
+                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all cursor-pointer hover:shadow-md active:scale-95 select-none ${config.cardColor} ${config.borderColor}`}
                                 >
-                                    <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
-                                    <StatusBadge status={sub.status} />
+                                    <div className="flex justify-between items-center w-full">
+                                        <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
+                                        <div className="flex items-center gap-1.5">
+                                            {/* 獨立免寫按鈕 */}
+                                            <button 
+                                                onClick={(e) => toggleExemptStatus(sub, e)}
+                                                className={`p-1.5 rounded-md border transition-all ${sub.status === 'exempt' ? 'bg-gray-300 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
+                                                title="切換免寫"
+                                            >
+                                                <Ban size={14} strokeWidth={3}/>
+                                            </button>
+                                            <StatusBadge status={sub.status} />
+                                        </div>
+                                    </div>
                                 </div>
                             )})}
                         </div>
@@ -511,14 +572,14 @@ export default function App() {
             </div>
         )}
 
-        {/* VIEW 2: BY STUDENT (已優化：使用全歷史名單，不會漏掉任何人) */}
+        {/* VIEW 2: BY STUDENT */}
         {activeTab === 'by-student' && selectedClassId && (
              <div className="space-y-6">
                 <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 print:hidden">
                     <label className="block text-xs font-semibold text-gray-500 mb-1">選擇座號</label>
                     <select value={selectedStudentId} onChange={(e) => setSelectedStudentId(e.target.value)} className="w-full sm:w-64 p-2 bg-gray-50 border border-gray-200 rounded-lg outline-none">
                         {allHistoricalStudents.length === 0 && <option>尚無學生</option>}
-                        {allHistoricalStudents.map(s => <option key={s.id} value={s.id}>{s.number} 號 {s.isActive ? '' : '(歷史紀錄)'}</option>)}
+                        {allHistoricalStudents?.map(s => <option key={s.id} value={s.id}>{s.number} 號 {s.isActive ? '' : '(歷史紀錄)'}</option>)}
                     </select>
                 </div>
                 {selectedStudentId && (
@@ -528,7 +589,7 @@ export default function App() {
                                 <tr><th className="px-6 py-3">日期</th><th className="px-6 py-3">作業</th><th className="px-6 py-3 print:hidden">變更狀態</th></tr>
                             </thead>
                             <tbody className="divide-y divide-gray-100 print:divide-gray-300">
-                                {assignments.map(assign => {
+                                {assignments?.map(assign => {
                                     const sub = submissions[`${assign.id}_${selectedStudentId}`];
                                     if(!sub) return null;
                                     return (
@@ -545,7 +606,7 @@ export default function App() {
              </div>
         )}
 
-        {/* VIEW 3: BATCH EXPORT (已優化：使用全歷史名單) */}
+        {/* VIEW 3: BATCH EXPORT */}
         {activeTab === 'export' && selectedClassId && (
             <div className="space-y-6">
                 <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 print:hidden">
@@ -557,7 +618,7 @@ export default function App() {
                                 <button onClick={handleSelectAllExport} className="text-sm text-indigo-600 font-medium">{exportSelectedAssignments.size === assignments.length ? '取消全選' : '全選'}</button>
                             </div>
                             <div className="border border-gray-200 rounded-lg max-h-96 overflow-y-auto bg-gray-50 p-2 space-y-1">
-                                {assignments.map(a => (
+                                {assignments?.map(a => (
                                     <div key={a.id} onClick={() => toggleExportAssignment(a.id)} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all ${exportSelectedAssignments.has(a.id) ? 'bg-indigo-50 border border-indigo-200' : 'bg-white border border-transparent hover:border-gray-200'}`}>
                                         {exportSelectedAssignments.has(a.id) ? <CheckSquare className="text-indigo-600" size={20}/> : <Square className="text-gray-400" size={20}/>}
                                         <div><div className="text-sm font-bold text-gray-800">{a.title}</div><div className="text-xs text-gray-500">{a.date}</div></div>
@@ -581,19 +642,19 @@ export default function App() {
                         <thead>
                             <tr className="bg-gray-100">
                                 <th className="border border-gray-300 p-2 w-16">座號</th>
-                                {selectedExportAssignsSorted.map(a => (
+                                {selectedExportAssignsSorted?.map(a => (
                                     <th key={a.id} className="border border-gray-300 p-2"><div className="text-xs text-gray-500">{a.date}</div><div>{a.title}</div></th>
                                 ))}
                             </tr>
                         </thead>
                         <tbody>
-                            {allHistoricalStudents.map(student => (
+                            {allHistoricalStudents?.map(student => (
                                 <tr key={student.id}>
                                     <td className="border border-gray-300 p-2 font-bold text-gray-700">
                                         {student.number}
                                         {!student.isActive && <span className="text-[10px] text-red-500 block font-normal leading-none mt-1">歷史</span>}
                                     </td>
-                                    {selectedExportAssignsSorted.map(a => {
+                                    {selectedExportAssignsSorted?.map(a => {
                                         const sub = submissions[`${a.id}_${student.id}`];
                                         const simpleLabel = sub?.status === 'completed' ? 'O' : sub?.status === 'correction' ? '△' : sub?.status === 'submitted' ? 'V' : sub?.status === 'exempt' ? '-' : '';
                                         return <td key={a.id} className={`border border-gray-300 p-2 font-bold ${sub ? STATUS_CONFIG[sub.status].printColor : ''}`}>{simpleLabel}</td>;
@@ -623,15 +684,20 @@ export default function App() {
                     <button onClick={() => setIsEditMode(!isEditMode)} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all shadow-sm ${isEditMode ? 'bg-red-500 text-white' : 'bg-white text-gray-600 border'}`}>{isEditMode ? <Unlock size={18}/> : <Lock size={18}/>} {isEditMode ? '編輯模式已開啟' : '開啟編輯模式'}</button>
                 </div>
                 )}
+                
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* 班級管理 */}
                     <div className="lg:col-span-3 bg-white p-6 rounded-xl shadow-sm border border-gray-200">
                         <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2 border-b pb-2"><Users size={20} className="text-indigo-600"/> 班級管理</h2>
                         <div className="flex flex-col sm:flex-row gap-4 items-end mb-4">
-                            <div className="flex-grow w-full"><label className="block text-sm font-medium text-gray-700 mb-1">建立新班級</label><input type="text" placeholder="例如：301 班" value={newClassName} onChange={(e) => setNewClassName(e.target.value)} className="w-full p-2 bg-gray-50 border border-gray-300 rounded-lg outline-none"/></div>
-                            <button onClick={handleAddClass} className="w-full sm:w-auto bg-gray-800 text-white py-2 px-6 rounded-lg">新增班級</button>
+                            <div className="flex-grow w-full">
+                                <label className="block text-sm font-medium text-gray-700 mb-1">建立新班級</label>
+                                <input type="text" placeholder="例如：301 班" value={newClassName} onChange={(e) => setNewClassName(e.target.value)} className="w-full p-2 bg-gray-50 border border-gray-300 rounded-lg outline-none"/>
+                            </div>
+                            <button onClick={handleAddClass} className="w-full sm:w-auto bg-gray-800 text-white py-2 px-6 rounded-lg font-bold">新增班級</button>
                         </div>
                         <div className="flex flex-wrap gap-2">
-                            {classes.map(c => (
+                            {classes?.map(c => (
                                 <div key={c.id} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border ${selectedClassId === c.id ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-bold' : 'bg-white border-gray-200'}`}>
                                     <span>{c.name}</span>
                                     {isEditMode && selectedClassId !== c.id && <button onClick={(e) => {e.stopPropagation(); handleDeleteClass(c.id);}} className="ml-2 text-red-400 hover:text-red-600"><X size={14}/></button>}
@@ -639,22 +705,82 @@ export default function App() {
                             ))}
                         </div>
                     </div>
+
                     {selectedClassId && (
                         <>
+                        {/* 作業管理 */}
                         <div className="lg:col-span-2 bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col min-h-[500px]">
                             <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2"><FileText size={20} className="text-indigo-600"/> 作業管理</h2>
-                            <form onSubmit={handleAddAssignment} className="flex gap-2 mb-6 p-3 bg-gray-50 rounded-lg border border-gray-100"><input type="date" required value={newAssignmentDate} onChange={(e) => setNewAssignmentDate(e.target.value)} className="w-32 p-2 bg-white border border-gray-200 rounded-md outline-none"/><input type="text" placeholder="新增作業..." required value={newAssignmentTitle} onChange={(e) => setNewAssignmentTitle(e.target.value)} className="flex-grow p-2 bg-white border rounded-md outline-none"/><button type="submit" className="bg-indigo-600 text-white p-2 rounded-md"><Plus size={20}/></button></form>
+                            <form onSubmit={handleAddAssignment} className="flex gap-2 mb-6 p-3 bg-gray-50 rounded-lg border border-gray-100">
+                                <input type="date" required value={newAssignmentDate} onChange={(e) => setNewAssignmentDate(e.target.value)} className="w-32 p-2 bg-white border border-gray-200 rounded-md outline-none"/>
+                                <input type="text" placeholder="新增作業..." required value={newAssignmentTitle} onChange={(e) => setNewAssignmentTitle(e.target.value)} className="flex-grow p-2 bg-white border rounded-md outline-none"/>
+                                <button type="submit" className="bg-indigo-600 text-white p-2 rounded-md hover:bg-indigo-700"><Plus size={20}/></button>
+                            </form>
                             <div className="flex-grow overflow-y-auto pr-2 space-y-2">
-                                {assignments.map(a => {
+                                {assignments?.map(a => {
                                     const status = getAssignmentCompletion(a.id);
-                                    return <div key={a.id} className={`flex justify-between items-center p-3 rounded-lg border ${status.isDone ? 'bg-green-50 border-green-200' : 'bg-white'}`}><div className="flex items-center gap-3"><div className={`w-10 h-10 rounded-full flex items-center justify-center text-xs font-bold ${status.isDone ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>{status.isDone ? <Check size={18}/> : `${Math.round((status.completed / (status.total||1))*100)}%`}</div><div><div className="text-sm font-medium">{a.title}</div><div className="text-xs text-gray-500">{a.date}</div></div></div>{isEditMode && <button onClick={(e)=>{e.stopPropagation(); deleteAssignment(a.id)}} className="p-2 bg-red-100 text-red-600 rounded-lg"><Trash2 size={18}/></button>}</div>
+                                    const percent = Math.round((status.completed / (status.total || 1)) * 100);
+                                    return (
+                                        <div key={a.id} className={`flex justify-between items-center p-3 rounded-lg border ${status.isDone ? 'bg-green-50 border-green-200' : 'bg-white border-gray-200'}`}>
+                                            <div className="flex items-center gap-3">
+                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center text-xs font-bold ${status.isDone ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
+                                                    {status.isDone ? <Check size={18}/> : `${percent}%`}
+                                                </div>
+                                                <div>
+                                                    <div className="text-sm font-medium text-gray-800">{a.title}</div>
+                                                    <div className="text-xs text-gray-500">{a.date}</div>
+                                                </div>
+                                            </div>
+                                            {isEditMode && (
+                                                <button onClick={(e)=>{e.stopPropagation(); deleteAssignment(a.id)}} className="p-2 bg-red-100 text-red-600 rounded-lg hover:bg-red-200">
+                                                    <Trash2 size={18}/>
+                                                </button>
+                                            )}
+                                        </div>
+                                    )
                                 })}
                             </div>
                         </div>
+
+                        {/* 學生座號管理 */}
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col min-h-[500px]">
                             <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2"><User size={20} className="text-indigo-600"/> 學生座號管理</h2>
-                            <form onSubmit={handleBatchCreateStudents} className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-100"><div className="flex items-center gap-2 mb-3"><input type="number" value={startNumber} onChange={(e)=>setStartNumber(parseInt(e.target.value))} className="w-full p-2 bg-white border rounded-md text-center"/><span className="text-gray-400">~</span><input type="number" value={endNumber} onChange={(e)=>setEndNumber(parseInt(e.target.value))} className="w-full p-2 bg-white border rounded-md text-center"/></div><button type="submit" disabled={isLoading} className="w-full bg-indigo-600 text-white py-2 rounded-md flex justify-center gap-2">{isLoading?<RefreshCw className="animate-spin"/>:<Plus/>} 產生/補號</button></form>
-                            <div className="flex-grow overflow-y-auto pr-1"><div className="grid grid-cols-5 gap-2">{students.map(s => <div key={s.id} className={`relative bg-white border rounded-lg p-2 text-center ${isEditMode?'border-red-200 bg-red-50':'border-gray-200'}`}><span className="text-lg font-bold font-mono">{s.number}</span>{isEditMode && <button onClick={(e)=>{e.stopPropagation(); deleteStudent(s.id)}} className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1"><X size={12}/></button>}</div>)}</div></div>
+                            <form onSubmit={handleBatchCreateStudents} className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-100">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <input 
+                                        type="number" 
+                                        value={startNumber} 
+                                        onChange={(e) => setStartNumber(e.target.value === '' ? '' : parseInt(e.target.value))} 
+                                        className="w-full p-2 bg-white border border-gray-300 rounded-md text-center outline-none focus:border-indigo-500"
+                                        placeholder="起"
+                                    />
+                                    <span className="text-gray-400 font-bold">~</span>
+                                    <input 
+                                        type="number" 
+                                        value={endNumber} 
+                                        onChange={(e) => setEndNumber(e.target.value === '' ? '' : parseInt(e.target.value))} 
+                                        className="w-full p-2 bg-white border border-gray-300 rounded-md text-center outline-none focus:border-indigo-500"
+                                        placeholder="迄"
+                                    />
+                                </div>
+                                <button type="submit" disabled={isLoading} className="w-full bg-indigo-600 text-white py-2 rounded-md flex justify-center items-center gap-2 font-bold disabled:bg-indigo-400 hover:bg-indigo-700">
+                                    {isLoading ? <RefreshCw className="animate-spin" size={18}/> : <Plus size={18}/>} 產生/補號
+                                </button>
+                            </form>
+                            <div className="flex-grow overflow-y-auto pr-1">
+                                <div className="grid grid-cols-4 sm:grid-cols-5 gap-2">
+                                    {students?.map(s => (
+                                        <div key={s.id} className={`relative bg-white border rounded-lg p-2 text-center transition-colors ${isEditMode ? 'border-red-200 bg-red-50' : 'border-gray-200'}`}>
+                                            <span className="text-lg font-bold font-mono text-gray-700">{s.number}</span>
+                                            {isEditMode && (
+                                                <button onClick={(e)=>{e.stopPropagation(); deleteStudent(s.id)}} className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 shadow-sm hover:scale-110 transition-transform">
+                                                    <X size={12}/>
+                                                </button>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
                         </div>
                         </>
                     )}
