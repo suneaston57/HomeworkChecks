@@ -88,10 +88,11 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
   submitted: { label: '已繳', color: 'bg-blue-600 text-white shadow-sm', cardColor: 'bg-blue-50', borderColor: 'border-blue-400', printColor: 'text-blue-600', icon: FileText },
   correction: { label: '訂正', color: 'bg-orange-600 text-white shadow-sm', cardColor: 'bg-orange-50', borderColor: 'border-orange-400', printColor: 'text-orange-600', icon: AlertCircle },
   completed: { label: '完成', color: 'bg-emerald-600 text-white shadow-sm', cardColor: 'bg-emerald-50', borderColor: 'border-emerald-400', printColor: 'text-emerald-600', icon: CheckCircle },
-  exempt: { label: '免寫', color: 'bg-gray-300 text-gray-700 shadow-sm', cardColor: 'bg-gray-100', borderColor: 'border-gray-300', printColor: 'text-gray-500', icon: Ban }
+  exempt: { label: '免寫', color: 'bg-teal-600 text-white shadow-sm', cardColor: 'bg-teal-50', borderColor: 'border-teal-400', printColor: 'text-teal-600', icon: Ban }
 };
 
 const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
+// 獨立出一個純淨的 4 階段循環，讓點擊卡片時不會被免寫卡住
 const CYCLE_STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
 
 const downloadCSV = (content: string, filename: string) => {
@@ -128,11 +129,8 @@ export default function App() {
   const [exportSelectedAssignments, setExportSelectedAssignments] = useState<Set<string>>(new Set());
 
   const [newClassName, setNewClassName] = useState('');
-  
-  // 【安全升級】完全改用 String State 以避免 React 渲染 NaN 造成的白屏崩潰
-  const [startNumber, setStartNumber] = useState('1');
-  const [endNumber, setEndNumber] = useState('30');
-  
+  const [startNumber, setStartNumber] = useState<number | ''>(1);
+  const [endNumber, setEndNumber] = useState<number | ''>(30);
   const [newAssignmentTitle, setNewAssignmentTitle] = useState('');
   const [newAssignmentDate, setNewAssignmentDate] = useState(new Date().toISOString().split('T')[0]);
 
@@ -233,14 +231,12 @@ export default function App() {
     return stats;
   }, [currentAssignmentSubmissions]);
 
-  // 【安全升級】保證回傳的物件完全安全，不會因為除以 0 當機
+  // 安全取得進度
   const getAssignmentCompletion = (assignId: string) => {
-      if (!submissions) return { completed: 0, total: 0, isDone: false };
-      const subs = Object.values(submissions).filter(s => s?.assignmentId === assignId);
-      if (!subs || subs.length === 0) return { completed: 0, total: 0, isDone: false };
-      
-      const completed = subs.filter(s => s?.status === 'completed').length;
-      const exempt = subs.filter(s => s?.status === 'exempt').length;
+      const subs = Object.values(submissions).filter(s => s.assignmentId === assignId);
+      if (subs.length === 0) return { completed: 0, total: 0, isDone: false };
+      const completed = subs.filter(s => s.status === 'completed').length;
+      const exempt = subs.filter(s => s.status === 'exempt').length;
       return { completed, total: subs.length, isDone: (completed + exempt) === subs.length };
   };
 
@@ -248,13 +244,16 @@ export default function App() {
   const handleCycleStatus = async (sub: Submission) => {
     if (!user) return;
     
-    // 如果是免寫狀態，直接鎖定卡片點擊，不執行狀態切換
-    if (sub.status === 'exempt') return; 
-
-    // 只在 4 個主要狀態間循環
-    const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
-    const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
-    const newStatus = CYCLE_STATUS_ORDER[nextIndex];
+    let newStatus: StatusType;
+    if (sub.status === 'exempt') {
+        // 如果目前是免寫，點擊後回到未繳
+        newStatus = 'missing';
+    } else {
+        // 只在 4 個主要狀態間循環，忽略免寫
+        const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
+        const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
+        newStatus = CYCLE_STATUS_ORDER[nextIndex];
+    }
 
     try {
         await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
@@ -263,7 +262,7 @@ export default function App() {
 
   // 獨立的切換免寫功能
   const toggleExemptStatus = async (sub: Submission, e: React.MouseEvent) => {
-    e.stopPropagation(); // 阻止事件冒泡
+    e.stopPropagation(); // 阻止事件冒泡，避免觸發上方卡片的點擊循環
     if (!user) return;
     const newStatus = sub.status === 'exempt' ? 'missing' : 'exempt';
     try {
@@ -321,22 +320,12 @@ export default function App() {
 
   const handleBatchCreateStudents = async (e: React.FormEvent) => {
     e.preventDefault();
-    
-    // 【安全升級】解析字串狀態的數字
-    const startNum = parseInt(startNumber, 10);
-    const endNum = parseInt(endNumber, 10);
-
-    if (!user || !selectedClassId || isNaN(startNum) || isNaN(endNum) || startNum > endNum) {
-        showNotification("請輸入正確的起訖號碼", "error");
-        return;
-    }
-    
+    if (!user || !selectedClassId || startNumber === '' || endNumber === '' || startNumber > endNumber) return;
     setIsLoading(true);
     const batch = writeBatch(db);
     const existingNumbers = new Set((await getDocs(query(collection(db, 'students'), where('classId', '==', selectedClassId)))).docs.map(d => parseInt(d.data().number)));
-    
     let count = 0;
-    for (let i = startNum; i <= endNum; i++) {
+    for (let i = startNumber as number; i <= (endNumber as number); i++) {
         if (!existingNumbers.has(i)) {
             batch.set(doc(collection(db, 'students')), { number: i.toString().padStart(2, '0'), classId: selectedClassId, createdAt: serverTimestamp() });
             count++;
@@ -443,7 +432,7 @@ export default function App() {
 
   if (isLoading && classes.length === 0) return <div className="flex h-screen items-center justify-center bg-gray-50"><RefreshCw className="animate-spin text-indigo-600 w-8 h-8"/></div>;
 
-  const selectedExportAssignsSorted = (assignments || []).filter(a => exportSelectedAssignments.has(a.id)).sort((a,b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  const selectedExportAssignsSorted = assignments.filter(a => exportSelectedAssignments.has(a.id)).sort((a,b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans pb-10 print:bg-white print:p-0">
@@ -460,7 +449,7 @@ export default function App() {
               <div className="relative group">
                 <select value={selectedClassId} onChange={(e) => setSelectedClassId(e.target.value)} className="appearance-none bg-indigo-50 border border-indigo-100 text-indigo-700 py-1 pl-3 pr-8 rounded-lg text-sm font-bold focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer hover:bg-indigo-100 transition-colors">
                   <option value="" disabled>請選擇班級</option>
-                  {(classes || []).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  {classes?.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
                 <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-indigo-500 pointer-events-none"/>
               </div>
@@ -496,7 +485,7 @@ export default function App() {
                             <div className="flex gap-2 flex-1">
                                 <select value={selectedAssignmentId} onChange={(e) => setSelectedAssignmentId(e.target.value)} className="flex-grow py-1.5 pl-2 pr-8 bg-white border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none text-ellipsis overflow-hidden">
                                     {assignments.length === 0 && <option>尚無作業</option>}
-                                    {(filteredAssignments || []).map(a => <option key={a.id} value={a.id}>{a.date} - {a.title}</option>)}
+                                    {filteredAssignments?.map(a => <option key={a.id} value={a.id}>{a.date} - {a.title}</option>)}
                                 </select>
                                 {selectedAssignmentId && <button onClick={() => syncStudentsToAssignment(selectedAssignmentId)} className="bg-indigo-50 text-indigo-600 px-2.5 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors flex-shrink-0" title="同步名單"><UserPlus size={16}/></button>}
                             </div>
@@ -507,7 +496,7 @@ export default function App() {
                             <div className="px-2"><div className="text-lg font-bold text-green-600 leading-tight">{currentAssignmentStats.completed}</div><div className="text-[10px] text-gray-500">完成</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-orange-500 leading-tight">{currentAssignmentStats.correction}</div><div className="text-[10px] text-gray-500">訂正</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-blue-500 leading-tight">{currentAssignmentStats.submitted}</div><div className="text-[10px] text-gray-500">已繳</div></div>
-                            <div className="px-2"><div className="text-lg font-bold text-gray-600 leading-tight">{currentAssignmentStats.exempt}</div><div className="text-[10px] text-gray-500">免寫</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-teal-600 leading-tight">{currentAssignmentStats.exempt}</div><div className="text-[10px] text-gray-500">免寫</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-gray-400 leading-tight">{currentAssignmentStats.missing}</div><div className="text-[10px] text-gray-500">未繳</div></div>
                         </div>
                     )}
@@ -528,7 +517,7 @@ export default function App() {
                                     <tr 
                                         key={sub.id} 
                                         onClick={() => handleCycleStatus(sub)} 
-                                        className={`relative select-none transition-colors ${isExempt ? 'bg-gray-100 opacity-80' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
+                                        className={`relative select-none transition-colors ${isExempt ? 'bg-teal-50/50' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
                                     >
                                         <td className="relative px-4 py-3 font-mono text-xl font-bold text-gray-700">
                                             <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${borderColor}`}></div>
@@ -538,7 +527,7 @@ export default function App() {
                                             <div className="flex justify-end items-center gap-2">
                                                 <button 
                                                     onClick={(e) => toggleExemptStatus(sub, e)}
-                                                    className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-gray-200 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
+                                                    className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-teal-100 border-teal-500 text-teal-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
                                                     title="切換免寫鎖定"
                                                 >
                                                     <Ban size={22} strokeWidth={2.5}/>
@@ -563,14 +552,14 @@ export default function App() {
                                 <div 
                                     key={sub.id} 
                                     onClick={() => handleCycleStatus(sub)}
-                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all select-none ${config.cardColor} ${config.borderColor} ${isExempt ? 'opacity-80' : 'cursor-pointer hover:shadow-md active:scale-95'}`}
+                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all select-none ${config.cardColor} ${config.borderColor} ${isExempt ? '' : 'cursor-pointer hover:shadow-md active:scale-95'}`}
                                 >
                                     <div className="flex justify-between items-center w-full">
                                         <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
                                         <div className="flex items-center gap-1.5">
                                             <button 
                                                 onClick={(e) => toggleExemptStatus(sub, e)}
-                                                className={`p-1.5 rounded-md border transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-gray-300 border-gray-400 text-gray-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
+                                                className={`p-1.5 rounded-md border transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-teal-200 border-teal-500 text-teal-800 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
                                                 title="切換免寫鎖定"
                                             >
                                                 <Ban size={14} strokeWidth={3}/>
@@ -595,7 +584,7 @@ export default function App() {
                     <label className="block text-xs font-semibold text-gray-500 mb-1">選擇座號</label>
                     <select value={selectedStudentId} onChange={(e) => setSelectedStudentId(e.target.value)} className="w-full sm:w-64 p-2 bg-gray-50 border border-gray-200 rounded-lg outline-none">
                         {allHistoricalStudents.length === 0 && <option>尚無學生</option>}
-                        {(allHistoricalStudents || []).map(s => <option key={s.id} value={s.id}>{s.number} 號 {s.isActive ? '' : '(歷史紀錄)'}</option>)}
+                        {allHistoricalStudents?.map(s => <option key={s.id} value={s.id}>{s.number} 號 {s.isActive ? '' : '(歷史紀錄)'}</option>)}
                     </select>
                 </div>
                 {selectedStudentId && (
@@ -605,7 +594,7 @@ export default function App() {
                                 <tr><th className="px-6 py-3">日期</th><th className="px-6 py-3">作業</th><th className="px-6 py-3 print:hidden">變更狀態</th></tr>
                             </thead>
                             <tbody className="divide-y divide-gray-100 print:divide-gray-300">
-                                {(assignments || []).map(assign => {
+                                {assignments?.map(assign => {
                                     const sub = submissions[`${assign.id}_${selectedStudentId}`];
                                     if(!sub) return null;
                                     return (
@@ -634,7 +623,7 @@ export default function App() {
                                 <button onClick={handleSelectAllExport} className="text-sm text-indigo-600 font-medium">{exportSelectedAssignments.size === assignments.length ? '取消全選' : '全選'}</button>
                             </div>
                             <div className="border border-gray-200 rounded-lg max-h-96 overflow-y-auto bg-gray-50 p-2 space-y-1">
-                                {(assignments || []).map(a => (
+                                {assignments?.map(a => (
                                     <div key={a.id} onClick={() => toggleExportAssignment(a.id)} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all ${exportSelectedAssignments.has(a.id) ? 'bg-indigo-50 border border-indigo-200' : 'bg-white border border-transparent hover:border-gray-200'}`}>
                                         {exportSelectedAssignments.has(a.id) ? <CheckSquare className="text-indigo-600" size={20}/> : <Square className="text-gray-400" size={20}/>}
                                         <div><div className="text-sm font-bold text-gray-800">{a.title}</div><div className="text-xs text-gray-500">{a.date}</div></div>
@@ -664,7 +653,7 @@ export default function App() {
                             </tr>
                         </thead>
                         <tbody>
-                            {(allHistoricalStudents || []).map(student => (
+                            {allHistoricalStudents?.map(student => (
                                 <tr key={student.id}>
                                     <td className="border border-gray-300 p-2 font-bold text-gray-700">
                                         {student.number}
@@ -691,7 +680,7 @@ export default function App() {
             </div>
         )}
 
-        {/* VIEW 4: MANAGE (已強化安全渲染) */}
+        {/* VIEW 4: MANAGE */}
         {activeTab === 'manage' && (
             <div className="space-y-6 print:hidden">
                 {selectedClassId && (
@@ -713,7 +702,7 @@ export default function App() {
                             <button onClick={handleAddClass} className="w-full sm:w-auto bg-gray-800 text-white py-2 px-6 rounded-lg font-bold">新增班級</button>
                         </div>
                         <div className="flex flex-wrap gap-2">
-                            {(classes || []).map(c => (
+                            {classes?.map(c => (
                                 <div key={c.id} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border ${selectedClassId === c.id ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-bold' : 'bg-white border-gray-200'}`}>
                                     <span>{c.name}</span>
                                     {isEditMode && selectedClassId !== c.id && <button onClick={(e) => {e.stopPropagation(); handleDeleteClass(c.id);}} className="ml-2 text-red-400 hover:text-red-600"><X size={14}/></button>}
@@ -733,12 +722,9 @@ export default function App() {
                                 <button type="submit" className="bg-indigo-600 text-white p-2 rounded-md hover:bg-indigo-700"><Plus size={20}/></button>
                             </form>
                             <div className="flex-grow overflow-y-auto pr-2 space-y-2">
-                                {(assignments || []).map(a => {
+                                {assignments?.map(a => {
                                     const status = getAssignmentCompletion(a.id);
-                                    // 安全計算百分比，確保不會出現 NaN
-                                    const totalForCalc = status.total || 1;
-                                    const percent = Math.round((status.completed / totalForCalc) * 100) || 0;
-                                    
+                                    const percent = Math.round((status.completed / (status.total || 1)) * 100);
                                     return (
                                         <div key={a.id} className={`flex justify-between items-center p-3 rounded-lg border ${status.isDone ? 'bg-green-50 border-green-200' : 'bg-white border-gray-200'}`}>
                                             <div className="flex items-center gap-3">
@@ -769,7 +755,7 @@ export default function App() {
                                     <input 
                                         type="number" 
                                         value={startNumber} 
-                                        onChange={(e) => setStartNumber(e.target.value)} 
+                                        onChange={(e) => setStartNumber(e.target.value === '' ? '' : parseInt(e.target.value))} 
                                         className="w-full p-2 bg-white border border-gray-300 rounded-md text-center outline-none focus:border-indigo-500"
                                         placeholder="起"
                                     />
@@ -777,7 +763,7 @@ export default function App() {
                                     <input 
                                         type="number" 
                                         value={endNumber} 
-                                        onChange={(e) => setEndNumber(e.target.value)} 
+                                        onChange={(e) => setEndNumber(e.target.value === '' ? '' : parseInt(e.target.value))} 
                                         className="w-full p-2 bg-white border border-gray-300 rounded-md text-center outline-none focus:border-indigo-500"
                                         placeholder="迄"
                                     />
@@ -788,9 +774,9 @@ export default function App() {
                             </form>
                             <div className="flex-grow overflow-y-auto pr-1">
                                 <div className="grid grid-cols-4 sm:grid-cols-5 gap-2">
-                                    {(students || []).map(s => (
+                                    {students?.map(s => (
                                         <div key={s.id} className={`relative bg-white border rounded-lg p-2 text-center transition-colors ${isEditMode ? 'border-red-200 bg-red-50' : 'border-gray-200'}`}>
-                                            <span className="text-lg font-bold font-mono text-gray-700">{s?.number}</span>
+                                            <span className="text-lg font-bold font-mono text-gray-700">{s.number}</span>
                                             {isEditMode && (
                                                 <button onClick={(e)=>{e.stopPropagation(); deleteStudent(s.id)}} className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 shadow-sm hover:scale-110 transition-transform">
                                                     <X size={12}/>
