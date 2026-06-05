@@ -44,7 +44,11 @@ import {
   ListChecks,
   Square,
   CheckSquare,
-  Ban
+  Ban,
+  Calendar,
+  MessageSquare,
+  Copy,
+  Clock
 } from 'lucide-react';
 
 // --- 注入 Tailwind CSS 與修改網頁標題 ---
@@ -92,7 +96,6 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
 };
 
 const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
-// 獨立出一個純淨的 4 階段循環，讓點擊卡片時不會被免寫卡住
 const CYCLE_STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
 
 const downloadCSV = (content: string, filename: string) => {
@@ -107,6 +110,16 @@ const downloadCSV = (content: string, filename: string) => {
   document.body.removeChild(link);
 };
 
+// 計算日期差距天數
+const getDaysDifference = (dateStr: string) => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const targetDate = new Date(dateStr);
+  targetDate.setHours(0, 0, 0, 0);
+  const diffTime = today.getTime() - targetDate.getTime();
+  return Math.floor(diffTime / (1000 * 60 * 60 * 24));
+};
+
 // --- Main Component ---
 export default function App() {
   const [user, setUser] = useState<any>(null);
@@ -117,13 +130,20 @@ export default function App() {
   const [submissions, setSubmissions] = useState<Record<string, Submission>>({});
   
   const [selectedClassId, setSelectedClassId] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'by-assignment' | 'by-student' | 'export' | 'manage'>('by-assignment');
+  // 新增 workflow Tab 每日點收工作流
+  const [activeTab, setActiveTab] = useState<'workflow' | 'by-assignment' | 'by-student' | 'export' | 'manage'>('workflow');
   const [selectedAssignmentId, setSelectedAssignmentId] = useState<string>('');
   const [selectedStudentId, setSelectedStudentId] = useState<string>('');
   const [isLoading, setIsLoading] = useState(true);
   const [notification, setNotification] = useState<Notification | null>(null);
   const [permissionError, setPermissionError] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
+
+  // Workflow UI State
+  const [activeWorkflowDay, setActiveWorkflowDay] = useState<number>(2); // 預設顯示二日催繳
+  const [showNotificationModal, setShowNotificationModal] = useState(false);
+  const [modalTitle, setModalTitle] = useState('');
+  const [modalText, setModalText] = useState('');
 
   const [assignmentSearchTerm, setAssignmentSearchTerm] = useState('');
   const [exportSelectedAssignments, setExportSelectedAssignments] = useState<Set<string>>(new Set());
@@ -240,20 +260,43 @@ export default function App() {
       return { completed, total: subs.length, isDone: (completed + exempt) === subs.length };
   };
 
+  // --- 每日工作流專用過濾器 ---
+  // 依據作業日期計算，分類成：今日、第2天、第3天、第7天或以上
+  const workflowGroupedAssignments = useMemo(() => {
+    const groups: Record<number, Assignment[]> = {
+      1: [], // 今日新增 & 第一天點收 (0或1天)
+      2: [], // 二日催繳 (2天)
+      3: [], // 三日跟進 (3天)
+      7: []  // 七日結案 (7天或以上)
+    };
+
+    assignments.forEach(assign => {
+      const diff = getDaysDifference(assign.date);
+      if (diff === 0 || diff === 1) {
+        groups[1].push(assign);
+      } else if (diff === 2) {
+        groups[2].push(assign);
+      } else if (diff === 3) {
+        groups[3].push(assign);
+      } else if (diff >= 7) {
+        groups[7].push(assign);
+      }
+    });
+
+    return groups;
+  }, [assignments]);
+
   // --- Core Action: Cycle Status ---
   const handleCycleStatus = async (sub: Submission) => {
     if (!user) return;
     
-    let newStatus: StatusType;
-    if (sub.status === 'exempt') {
-        // 如果目前是免寫，點擊後回到未繳
-        newStatus = 'missing';
-    } else {
-        // 只在 4 個主要狀態間循環，忽略免寫
-        const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
-        const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
-        newStatus = CYCLE_STATUS_ORDER[nextIndex];
-    }
+    // 如果是免寫狀態，直接鎖定卡片點擊，不執行狀態切換
+    if (sub.status === 'exempt') return; 
+
+    // 只在 4 個主要狀態間循環
+    const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
+    const nextIndex = (currentIndex + 1) % CYCLE_STATUS_ORDER.length;
+    const newStatus = CYCLE_STATUS_ORDER[nextIndex];
 
     try {
         await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
@@ -262,7 +305,7 @@ export default function App() {
 
   // 獨立的切換免寫功能
   const toggleExemptStatus = async (sub: Submission, e: React.MouseEvent) => {
-    e.stopPropagation(); // 阻止事件冒泡，避免觸發上方卡片的點擊循環
+    e.stopPropagation(); // 阻止事件冒泡
     if (!user) return;
     const newStatus = sub.status === 'exempt' ? 'missing' : 'exempt';
     try {
@@ -274,6 +317,46 @@ export default function App() {
     if (!user) return;
     try { await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true }); } 
     catch (err: any) { handleSnapshotError(err); }
+  };
+
+  // --- 家長聯絡簡訊生成邏輯 ---
+  const handleGenerateNotificationText = (assignment: Assignment, targetStatusList: StatusType[]) => {
+    // 取得該作業所有的點收資料
+    const list = Object.values(submissions)
+      .filter(s => s.assignmentId === assignment.id)
+      .sort((a, b) => parseInt(a.studentNumber || '0') - parseInt(b.studentNumber || '0'));
+
+    // 篩選出符合狀態（例如：未繳）的學生
+    const matchedSubmissions = list.filter(sub => targetStatusList.includes(sub.status));
+    if (matchedSubmissions.length === 0) {
+      showNotification("恭喜！沒有需要催繳的學生", "success");
+      return;
+    }
+
+    const missingNumbers = matchedSubmissions.map(s => parseInt(s.studentNumber)).join('、');
+    const className = classes.find(c => c.id === selectedClassId)?.name || '班級';
+
+    // 格式化催繳簡訊範本
+    const text = `親愛的家長您好：\n這裡是${className}作業通知。提醒您，貴子弟目前於【${assignment.date} - ${assignment.title}】作業之繳交狀況為「未完成」：\n\n⚠️ 目前尚未繳交之座號：${missingNumbers}\n\n為避免影響學業表現，請督促孩子儘速補齊並繳交，謝謝您的配合！`;
+    
+    setModalTitle(`${assignment.title} - 家長提醒文字`);
+    setModalText(text);
+    setShowNotificationModal(true);
+  };
+
+  const handleCopyToClipboard = (text: string) => {
+    // Clipboard API 的 iFrame 安全限制相容寫法
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      showNotification("已成功複製到剪貼簿", "success");
+    } catch (err) {
+      showNotification("複製失敗，請手動複製", "error");
+    }
+    document.body.removeChild(textarea);
   };
 
   // --- Export Logic ---
@@ -438,6 +521,42 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans pb-10 print:bg-white print:p-0">
       <NotificationToast />
       
+      {/* 催繳簡訊產生器彈出視窗 */}
+      {showNotificationModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-gray-100 animate-in fade-in-50 zoom-in-95 duration-200">
+            <div className="flex justify-between items-center mb-4 pb-2 border-b">
+              <h3 className="font-bold text-lg text-gray-800 flex items-center gap-2">
+                <MessageSquare className="text-indigo-600" size={20}/>
+                {modalTitle}
+              </h3>
+              <button onClick={() => setShowNotificationModal(false)} className="text-gray-400 hover:text-gray-600">
+                <X size={20}/>
+              </button>
+            </div>
+            <textarea 
+              value={modalText}
+              onChange={(e) => setModalText(e.target.value)}
+              className="w-full h-64 p-3 bg-gray-50 border border-gray-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none leading-relaxed resize-none"
+            />
+            <div className="flex gap-3 mt-4">
+              <button 
+                onClick={() => setShowNotificationModal(false)}
+                className="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl transition-all"
+              >
+                關閉
+              </button>
+              <button 
+                onClick={() => handleCopyToClipboard(modalText)}
+                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2"
+              >
+                <Copy size={16}/> 複製文字
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="bg-white shadow-sm sticky top-0 z-20 border-b border-gray-200 print:hidden">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col sm:flex-row h-auto sm:h-14 items-center justify-between py-2 sm:py-0 gap-2">
@@ -455,7 +574,13 @@ export default function App() {
               </div>
             </div>
             <nav className="flex space-x-1 bg-gray-100 p-1 rounded-lg w-full sm:w-auto overflow-x-auto">
-              {[{ id: 'by-assignment', label: '依作業', icon: FileText }, { id: 'by-student', label: '依學生', icon: User }, { id: 'export', label: '批次匯出', icon: ListChecks }, { id: 'manage', label: '管理資料', icon: Plus }].map((tab) => (
+              {[
+                { id: 'workflow', label: '工作流提醒', icon: Clock }, // 新增工作流 Tab
+                { id: 'by-assignment', label: '依作業', icon: FileText }, 
+                { id: 'by-student', label: '依學生', icon: User }, 
+                { id: 'export', label: '批次匯出', icon: ListChecks }, 
+                { id: 'manage', label: '管理資料', icon: Plus }
+              ].map((tab) => (
                 <button key={tab.id} onClick={() => setActiveTab(tab.id as any)} disabled={!selectedClassId && tab.id !== 'manage'} className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1 rounded-md text-sm font-medium transition-all whitespace-nowrap ${activeTab === tab.id ? 'bg-white text-indigo-600 shadow-sm' : !selectedClassId && tab.id !== 'manage' ? 'text-gray-300 cursor-not-allowed' : 'text-gray-500 hover:text-gray-700'}`}>
                   <tab.icon size={14} /><span>{tab.label}</span>
                 </button>
@@ -472,6 +597,144 @@ export default function App() {
 
       <main className="max-w-6xl mx-auto px-2 sm:px-4 lg:px-6 py-4 print:p-0 print:max-w-none">
         
+        {/* VIEW 0: DAILY WORKFLOW (新增：每日工作流Reminders) */}
+        {activeTab === 'workflow' && selectedClassId && (
+            <div className="space-y-6 print:hidden">
+                {/* 橫向切換時間工作階段 */}
+                <div className="bg-white p-3 rounded-xl shadow-sm border border-gray-100 flex flex-wrap gap-2">
+                    {[
+                        { day: 1, label: '第1天：今日新增/點收', desc: '作業點收與登錄', count: workflowGroupedAssignments[1].length, color: 'text-indigo-600 bg-indigo-50 border-indigo-100' },
+                        { day: 2, label: '第2天：二日催繳提醒', desc: '匯出未繳並提供催繳簡訊', count: workflowGroupedAssignments[2].length, color: 'text-orange-600 bg-orange-50 border-orange-100' },
+                        { day: 3, label: '第3天：三日加強跟進', desc: '跟進未繳與已繳尚未改完者', count: workflowGroupedAssignments[3].length, color: 'text-blue-600 bg-blue-50 border-blue-100' },
+                        { day: 7, label: '第7天：七日歷史結案', desc: '結算最後名單並封存', count: workflowGroupedAssignments[7].length, color: 'text-teal-600 bg-teal-50 border-teal-100' },
+                    ].map((phase) => (
+                        <button
+                            key={phase.day}
+                            onClick={() => setActiveWorkflowDay(phase.day)}
+                            className={`flex-1 min-w-[200px] text-left p-3 rounded-xl border-2 transition-all ${activeWorkflowDay === phase.day ? 'border-indigo-600 shadow-md ring-2 ring-indigo-100' : 'border-gray-100 hover:border-gray-200 bg-white'}`}
+                        >
+                            <div className="flex justify-between items-center mb-1">
+                                <span className="font-bold text-sm text-gray-800">{phase.label}</span>
+                                <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-100 text-gray-600">{phase.count} 筆作業</span>
+                            </div>
+                            <span className="text-xs text-gray-400 block leading-tight">{phase.desc}</span>
+                        </button>
+                    ))}
+                </div>
+
+                {/* 核心內容區 */}
+                <div className="space-y-4">
+                    {workflowGroupedAssignments[activeWorkflowDay].length === 0 ? (
+                        <div className="text-center py-20 bg-white rounded-xl border border-dashed text-gray-400">
+                            <Calendar className="mx-auto mb-3 text-gray-300 animate-pulse" size={40}/>
+                            <h3 className="font-bold">目前此時間區段內沒有需要處理的作業</h3>
+                            <p className="text-xs mt-1">系統將自動偵測作業建立時間，無須手動封存。</p>
+                        </div>
+                    ) : (
+                        workflowGroupedAssignments[activeWorkflowDay].map((assign) => {
+                            const compStats = getAssignmentCompletion(assign.id);
+                            // 取得此項作業的所有 Submission 資料
+                            const assignmentSubs = Object.values(submissions)
+                                .filter(s => s.assignmentId === assign.id)
+                                .sort((a, b) => parseInt(a.studentNumber || '0') - parseInt(b.studentNumber || '0'));
+
+                            // 依照狀態計數
+                            const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0 };
+                            assignmentSubs.forEach(s => { if (stats[s.status] !== undefined) stats[s.status]++; });
+
+                            return (
+                                <div key={assign.id} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                                    {/* 頂部標題列 */}
+                                    <div className="bg-gray-50 px-4 py-3 border-b flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                        <div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-bold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded">
+                                                    已指派 {getDaysDifference(assign.date)} 天
+                                                </span>
+                                                <span className="text-xs text-gray-400">{assign.date}</span>
+                                            </div>
+                                            <h3 className="font-bold text-gray-800 text-base mt-1">{assign.title}</h3>
+                                        </div>
+                                        
+                                        {/* 根據工作流階段，提供一鍵操作按鈕 */}
+                                        <div className="flex gap-2">
+                                            {activeWorkflowDay === 2 && (
+                                                <button 
+                                                    onClick={() => handleGenerateNotificationText(assign, ['missing'])}
+                                                    className="flex items-center gap-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-bold px-3 py-2 rounded-lg shadow-sm transition-all"
+                                                >
+                                                    <MessageSquare size={14}/> 產生催繳文字
+                                                </button>
+                                            )}
+                                            {activeWorkflowDay === 3 && (
+                                                <button 
+                                                    onClick={() => handleGenerateNotificationText(assign, ['missing', 'submitted'])}
+                                                    className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg shadow-sm transition-all"
+                                                >
+                                                    <MessageSquare size={14}/> 產生三日跟進清單
+                                                </button>
+                                            )}
+                                            {activeWorkflowDay === 7 && (
+                                                <button 
+                                                    onClick={() => handleGenerateNotificationText(assign, ['missing', 'submitted', 'correction'])}
+                                                    className="flex items-center gap-1.5 bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold px-3 py-2 rounded-lg shadow-sm transition-all"
+                                                >
+                                                    <MessageSquare size={14}/> 產生結案通知
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {/* 狀態數據條 */}
+                                    <div className="px-4 py-2 bg-gray-50/50 border-b flex justify-between items-center text-xs">
+                                        <div className="flex gap-4">
+                                            <span className="text-green-600 font-bold">完成：{stats.completed}</span>
+                                            <span className="text-orange-500 font-bold">訂正：{stats.correction}</span>
+                                            <span className="text-blue-500 font-bold">已繳：{stats.submitted}</span>
+                                            <span className="text-teal-600 font-bold">免寫：{stats.exempt}</span>
+                                            <span className="text-red-500 font-bold">未繳：{stats.missing}</span>
+                                        </div>
+                                        <div className="text-gray-400">共 {assignmentSubs.length} 人</div>
+                                    </div>
+
+                                    {/* 學生名塊列表 (僅篩選出當前工作流關注的座號，加速點收) */}
+                                    <div className="p-3">
+                                        <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-8 gap-2">
+                                            {assignmentSubs.map(sub => {
+                                                const config = STATUS_CONFIG[sub.status];
+                                                const isExempt = sub.status === 'exempt';
+
+                                                // 根據不同工作流階段，突出顯示或隱藏已完成的卡片，提高操作注意力
+                                                let isHighlighted = false;
+                                                if (activeWorkflowDay === 2 && sub.status === 'missing') isHighlighted = true;
+                                                if (activeWorkflowDay === 3 && (sub.status === 'missing' || sub.status === 'submitted')) isHighlighted = true;
+                                                if (activeWorkflowDay === 7 && sub.status !== 'completed' && sub.status !== 'exempt') isHighlighted = true;
+
+                                                return (
+                                                    <div 
+                                                        key={sub.id}
+                                                        onClick={() => handleCycleStatus(sub)}
+                                                        className={`p-2 rounded-lg text-center border-2 transition-all select-none ${isExempt ? '' : 'cursor-pointer hover:shadow active:scale-95'} ${isHighlighted ? 'ring-2 ring-red-400 ring-offset-1 font-extrabold' : ''} ${config.cardColor} ${config.borderColor}`}
+                                                    >
+                                                        <div className="flex flex-col items-center justify-center">
+                                                            <span className="text-base font-bold font-mono text-gray-800 leading-tight">{sub.studentNumber}</span>
+                                                            <span className={`mt-1 inline-flex items-center gap-0.5 px-1 py-0.5 rounded text-[10px] font-bold border ${config.color}`}>
+                                                                {config.label}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })
+                    )}
+                </div>
+            </div>
+        )}
+
         {/* VIEW 1: BY ASSIGNMENT */}
         {activeTab === 'by-assignment' && selectedClassId && (
             <div className="space-y-4">
@@ -508,7 +771,7 @@ export default function App() {
                              <table className="w-full text-sm text-left">
                                 <thead className="bg-gray-50 text-gray-500 font-medium"><tr><th className="px-4 py-2 w-16">座號</th><th className="px-4 py-2 text-right">狀態 (點擊切換)</th></tr></thead>
                                 <tbody className="divide-y divide-gray-100">
-                                {(currentAssignmentSubmissions || []).map(sub => {
+                                {currentAssignmentSubmissions?.map(sub => {
                                     const config = STATUS_CONFIG[sub.status];
                                     const borderColor = config.borderColor.replace('border-', 'bg-');
                                     const isExempt = sub.status === 'exempt';
@@ -517,7 +780,7 @@ export default function App() {
                                     <tr 
                                         key={sub.id} 
                                         onClick={() => handleCycleStatus(sub)} 
-                                        className={`relative select-none transition-colors ${isExempt ? 'bg-teal-50/50' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
+                                        className={`relative select-none transition-colors ${isExempt ? 'bg-teal-50/55' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
                                     >
                                         <td className="relative px-4 py-3 font-mono text-xl font-bold text-gray-700">
                                             <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${borderColor}`}></div>
@@ -544,7 +807,7 @@ export default function App() {
                         </div>
                         
                         <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
-                            {(currentAssignmentSubmissions || []).map(sub => {
+                            {currentAssignmentSubmissions?.map(sub => {
                                 const config = STATUS_CONFIG[sub.status];
                                 const isExempt = sub.status === 'exempt';
                                 
