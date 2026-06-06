@@ -1,5 +1,5 @@
 // @ts-nocheck
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -80,11 +80,12 @@ const db = getFirestore(app);
 type ClassGroup = { id: string; name: string; };
 type Student = { id: string; number: string; classId: string; };
 type Assignment = { id: string; title: string; date: string; classId: string; };
-type StatusType = 'missing' | 'submitted' | 'correction' | 'completed' | 'exempt';
+type StatusType = 'missing' | 'submitted' | 'correction' | 'completed' | 'exempt' | 'leave';
 type Submission = {
   id: string; assignmentId: string; studentId: string; studentNumber: string; status: StatusType; updatedAt?: any;
 };
 type Notification = { id: number; message: string; type: 'success' | 'error' | 'info'; };
+type Holiday = { date: string; name: string; };
 
 // --- Constants ---
 const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColor: string; borderColor: string; printColor: string; icon: any }> = {
@@ -92,10 +93,11 @@ const STATUS_CONFIG: Record<StatusType, { label: string; color: string; cardColo
   submitted: { label: '已繳', color: 'bg-blue-600 text-white shadow-sm', cardColor: 'bg-blue-50', borderColor: 'border-blue-400', printColor: 'text-blue-600', icon: FileText },
   correction: { label: '訂正', color: 'bg-orange-600 text-white shadow-sm', cardColor: 'bg-orange-50', borderColor: 'border-orange-400', printColor: 'text-orange-600', icon: AlertCircle },
   completed: { label: '完成', color: 'bg-emerald-600 text-white shadow-sm', cardColor: 'bg-emerald-50', borderColor: 'border-emerald-400', printColor: 'text-emerald-600', icon: CheckCircle },
-  exempt: { label: '免寫', color: 'bg-teal-600 text-white shadow-sm', cardColor: 'bg-teal-50', borderColor: 'border-teal-400', printColor: 'text-teal-600', icon: Ban }
+  exempt: { label: '免寫', color: 'bg-teal-600 text-white shadow-sm', cardColor: 'bg-teal-50', borderColor: 'border-teal-400', printColor: 'text-teal-600', icon: Ban },
+  leave: { label: '請假', color: 'bg-purple-600 text-white shadow-sm', cardColor: 'bg-purple-50', borderColor: 'border-purple-400', printColor: 'text-purple-600', icon: Calendar }
 };
 
-const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt'];
+const STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed', 'exempt', 'leave'];
 const CYCLE_STATUS_ORDER: StatusType[] = ['missing', 'submitted', 'correction', 'completed'];
 
 const downloadCSV = (content: string, filename: string) => {
@@ -110,16 +112,6 @@ const downloadCSV = (content: string, filename: string) => {
   document.body.removeChild(link);
 };
 
-// 計算日期差距天數
-const getDaysDifference = (dateStr: string) => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const targetDate = new Date(dateStr);
-  targetDate.setHours(0, 0, 0, 0);
-  const diffTime = today.getTime() - targetDate.getTime();
-  return Math.floor(diffTime / (1000 * 60 * 60 * 24));
-};
-
 // --- Main Component ---
 export default function App() {
   const [user, setUser] = useState<any>(null);
@@ -129,8 +121,10 @@ export default function App() {
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [submissions, setSubmissions] = useState<Record<string, Submission>>({});
   
+  // 新增放假日 State
+  const [holidays, setHolidays] = useState<Record<string, string>>({}); 
+
   const [selectedClassId, setSelectedClassId] = useState<string>('');
-  // 新增 workflow Tab 每日點收工作流
   const [activeTab, setActiveTab] = useState<'workflow' | 'by-assignment' | 'by-student' | 'export' | 'manage'>('workflow');
   const [selectedAssignmentId, setSelectedAssignmentId] = useState<string>('');
   const [selectedStudentId, setSelectedStudentId] = useState<string>('');
@@ -154,6 +148,10 @@ export default function App() {
   const [newAssignmentTitle, setNewAssignmentTitle] = useState('');
   const [newAssignmentDate, setNewAssignmentDate] = useState(new Date().toISOString().split('T')[0]);
 
+  // 新增放假日 Form State
+  const [newHolidayDate, setNewHolidayDate] = useState(new Date().toISOString().split('T')[0]);
+  const [newHolidayName, setNewHolidayName] = useState('');
+
   const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setNotification({ id: Date.now(), message, type });
     setTimeout(() => setNotification(null), 3000);
@@ -171,6 +169,7 @@ export default function App() {
     return onAuthStateChanged(auth, setUser);
   }, []);
 
+  // 1. Fetch Classes
   useEffect(() => {
     if (!user) return;
     const q = query(collection(db, 'classes'));
@@ -182,6 +181,7 @@ export default function App() {
     }, handleSnapshotError);
   }, [user]);
 
+  // 2. Fetch Students & Assignments
   useEffect(() => {
     if (!user || !selectedClassId) { setStudents([]); setAssignments([]); return; }
     
@@ -204,6 +204,53 @@ export default function App() {
 
     return () => { unsubStudents(); unsubAssignments(); unsubSubmissions(); };
   }, [user, selectedClassId]);
+
+  // 3. Fetch Holidays (雲端載入放假日)
+  useEffect(() => {
+    if (!user) return;
+    const q = query(collection(db, 'holidays'));
+    return onSnapshot(q, (snap) => {
+      const map: Record<string, string> = {};
+      snap.docs.forEach(d => {
+        const data = d.data();
+        map[d.id] = data.name || '放假';
+      });
+      setHolidays(map);
+    }, handleSnapshotError);
+  }, [user]);
+
+  // 將放假日期轉為高效率的 Set 供後續比對
+  const holidaySet = useMemo(() => new Set(Object.keys(holidays)), [holidays]);
+
+  // 【智慧工作日計算】排除週六、週日與自訂放假日
+  const getDaysDifference = useCallback((dateStr: string) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const targetDate = new Date(dateStr);
+    targetDate.setHours(0, 0, 0, 0);
+    
+    if (targetDate > today) return 0;
+    
+    let workingDays = 0;
+    const current = new Date(targetDate);
+    
+    while (current < today) {
+      current.setDate(current.getDate() + 1);
+      const dayOfWeek = current.getDay();
+      
+      // 本地安全的 YYYY-MM-DD 比對格式
+      const yyyy = current.getFullYear();
+      const mm = String(current.getMonth() + 1).padStart(2, '0');
+      const dd = String(current.getDate()).padStart(2, '0');
+      const currentStr = `${yyyy}-${mm}-${dd}`;
+      
+      // 如果不是週末，且不是自訂放假日，則計算為 1 個上課工作日
+      if (dayOfWeek !== 0 && dayOfWeek !== 6 && !holidaySet.has(currentStr)) {
+        workingDays++;
+      }
+    }
+    return workingDays;
+  }, [holidaySet]);
 
   // --- 歷史紀錄與現役學生合併邏輯 ---
   const allHistoricalStudents = useMemo(() => {
@@ -244,30 +291,30 @@ export default function App() {
   }, [submissions, selectedAssignmentId]);
 
   const currentAssignmentStats = useMemo(() => {
-    const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0 };
+    const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0, leave: 0 };
     currentAssignmentSubmissions.forEach(s => { 
         if (stats[s.status] !== undefined) stats[s.status]++; 
     });
     return stats;
   }, [currentAssignmentSubmissions]);
 
-  // 安全取得進度
+  // 安全取得進度 (請假與免寫皆算在不需催繳之內)
   const getAssignmentCompletion = (assignId: string) => {
       const subs = Object.values(submissions).filter(s => s.assignmentId === assignId);
       if (subs.length === 0) return { completed: 0, total: 0, isDone: false };
       const completed = subs.filter(s => s.status === 'completed').length;
       const exempt = subs.filter(s => s.status === 'exempt').length;
-      return { completed, total: subs.length, isDone: (completed + exempt) === subs.length };
+      const leave = subs.filter(s => s.status === 'leave').length;
+      return { completed, total: subs.length, isDone: (completed + exempt + leave) === subs.length };
   };
 
-  // --- 每日工作流專用過濾器 ---
-  // 依據作業日期計算，分類成：今日、第2天、第3天、第7天或以上
+  // --- 每日工作流專用過濾器 (加入 holidaySet 依賴) ---
   const workflowGroupedAssignments = useMemo(() => {
     const groups: Record<number, Assignment[]> = {
-      1: [], // 今日新增 & 第一天點收 (0或1天)
-      2: [], // 二日催繳 (2天)
-      3: [], // 三日跟進 (3天)
-      7: []  // 七日結案 (7天或以上)
+      1: [], // 今日新增 & 第一天點收 (0或1上課日)
+      2: [], // 二日催繳 (2上課日)
+      3: [], // 三日跟進 (3上課日)
+      7: []  // 七日結案 (7上課日或以上)
     };
 
     assignments.forEach(assign => {
@@ -284,14 +331,14 @@ export default function App() {
     });
 
     return groups;
-  }, [assignments]);
+  }, [assignments, getDaysDifference]);
 
   // --- Core Action: Cycle Status ---
   const handleCycleStatus = async (sub: Submission) => {
     if (!user) return;
     
-    // 如果是免寫狀態，直接鎖定卡片點擊，不執行狀態切換
-    if (sub.status === 'exempt') return; 
+    // 免寫與請假狀態會鎖定卡片點擊，不執行狀態切換
+    if (sub.status === 'exempt' || sub.status === 'leave') return; 
 
     // 只在 4 個主要狀態間循環
     const currentIndex = CYCLE_STATUS_ORDER.indexOf(sub.status);
@@ -305,9 +352,19 @@ export default function App() {
 
   // 獨立的切換免寫功能
   const toggleExemptStatus = async (sub: Submission, e: React.MouseEvent) => {
-    e.stopPropagation(); // 阻止事件冒泡
+    e.stopPropagation(); 
     if (!user) return;
     const newStatus = sub.status === 'exempt' ? 'missing' : 'exempt';
+    try {
+        await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
+    } catch (err: any) { handleSnapshotError(err); }
+  };
+
+  // 獨立的切換請假功能 (請假座號會自動排除催繳，不發送通知)
+  const toggleLeaveStatus = async (sub: Submission, e: React.MouseEvent) => {
+    e.stopPropagation(); 
+    if (!user) return;
+    const newStatus = sub.status === 'leave' ? 'missing' : 'leave';
     try {
         await setDoc(doc(db, 'submissions', sub.id), { status: newStatus, updatedAt: serverTimestamp() }, { merge: true });
     } catch (err: any) { handleSnapshotError(err); }
@@ -321,12 +378,10 @@ export default function App() {
 
   // --- 家長聯絡簡訊生成邏輯 ---
   const handleGenerateNotificationText = (assignment: Assignment, targetStatusList: StatusType[]) => {
-    // 取得該作業所有的點收資料
     const list = Object.values(submissions)
       .filter(s => s.assignmentId === assignment.id)
       .sort((a, b) => parseInt(a.studentNumber || '0') - parseInt(b.studentNumber || '0'));
 
-    // 篩選出符合狀態（例如：未繳）的學生
     const matchedSubmissions = list.filter(sub => targetStatusList.includes(sub.status));
     if (matchedSubmissions.length === 0) {
       showNotification("恭喜！沒有需要催繳的學生", "success");
@@ -336,7 +391,6 @@ export default function App() {
     const missingNumbers = matchedSubmissions.map(s => parseInt(s.studentNumber)).join('、');
     const className = classes.find(c => c.id === selectedClassId)?.name || '班級';
 
-    // 格式化催繳簡訊範本
     const text = `親愛的家長您好：\n這裡是${className}作業通知。提醒您，貴子弟目前於【${assignment.date} - ${assignment.title}】作業之繳交狀況為「未完成」：\n\n⚠️ 目前尚未繳交之座號：${missingNumbers}\n\n為避免影響學業表現，請督促孩子儘速補齊並繳交，謝謝您的配合！`;
     
     setModalTitle(`${assignment.title} - 家長提醒文字`);
@@ -345,7 +399,6 @@ export default function App() {
   };
 
   const handleCopyToClipboard = (text: string) => {
-    // Clipboard API 的 iFrame 安全限制相容寫法
     const textarea = document.createElement('textarea');
     textarea.value = text;
     document.body.appendChild(textarea);
@@ -382,6 +435,34 @@ export default function App() {
     });
     downloadCSV(csvContent, `${classes.find(c => c.id === selectedClassId)?.name || '未命名'}_作業繳交總表.csv`);
     showNotification("總表已匯出", "success");
+  };
+
+  // --- 放假日雲端管理 Actions ---
+  const handleAddHoliday = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !newHolidayDate) return;
+    try {
+      await setDoc(doc(db, 'holidays', newHolidayDate), {
+        date: newHolidayDate,
+        name: newHolidayName || '自訂放假',
+        createdAt: serverTimestamp()
+      });
+      setNewHolidayName('');
+      showNotification('放假日已新增', 'success');
+    } catch (err) {
+      console.error(err);
+      showNotification('新增失敗', 'error');
+    }
+  };
+
+  const handleDeleteHoliday = async (dateKey: string) => {
+    try {
+      await deleteDoc(doc(db, 'holidays', dateKey));
+      showNotification('放假日已刪除', 'success');
+    } catch (err) {
+      console.error(err);
+      showNotification('刪除失敗', 'error');
+    }
   };
 
   const handlePrint = () => window.print();
@@ -575,7 +656,7 @@ export default function App() {
             </div>
             <nav className="flex space-x-1 bg-gray-100 p-1 rounded-lg w-full sm:w-auto overflow-x-auto">
               {[
-                { id: 'workflow', label: '工作流提醒', icon: Clock }, // 新增工作流 Tab
+                { id: 'workflow', label: '工作流提醒', icon: Clock }, 
                 { id: 'by-assignment', label: '依作業', icon: FileText }, 
                 { id: 'by-student', label: '依學生', icon: User }, 
                 { id: 'export', label: '批次匯出', icon: ListChecks }, 
@@ -597,7 +678,7 @@ export default function App() {
 
       <main className="max-w-6xl mx-auto px-2 sm:px-4 lg:px-6 py-4 print:p-0 print:max-w-none">
         
-        {/* VIEW 0: DAILY WORKFLOW (新增：每日工作流Reminders) */}
+        {/* VIEW 0: DAILY WORKFLOW */}
         {activeTab === 'workflow' && selectedClassId && (
             <div className="space-y-6 print:hidden">
                 {/* 橫向切換時間工作階段 */}
@@ -628,18 +709,17 @@ export default function App() {
                         <div className="text-center py-20 bg-white rounded-xl border border-dashed text-gray-400">
                             <Calendar className="mx-auto mb-3 text-gray-300 animate-pulse" size={40}/>
                             <h3 className="font-bold">目前此時間區段內沒有需要處理的作業</h3>
-                            <p className="text-xs mt-1">系統將自動偵測作業建立時間，無須手動封存。</p>
+                            <p className="text-xs mt-1">系統將自動偵測作業建立時間，排除週末與假日。</p>
                         </div>
                     ) : (
                         workflowGroupedAssignments[activeWorkflowDay].map((assign) => {
                             const compStats = getAssignmentCompletion(assign.id);
-                            // 取得此項作業的所有 Submission 資料
                             const assignmentSubs = Object.values(submissions)
                                 .filter(s => s.assignmentId === assign.id)
                                 .sort((a, b) => parseInt(a.studentNumber || '0') - parseInt(b.studentNumber || '0'));
 
                             // 依照狀態計數
-                            const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0 };
+                            const stats = { completed: 0, correction: 0, submitted: 0, missing: 0, exempt: 0, leave: 0 };
                             assignmentSubs.forEach(s => { if (stats[s.status] !== undefined) stats[s.status]++; });
 
                             return (
@@ -649,7 +729,7 @@ export default function App() {
                                         <div>
                                             <div className="flex items-center gap-2">
                                                 <span className="text-xs font-bold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded">
-                                                    已指派 {getDaysDifference(assign.date)} 天
+                                                    上課工作日已指派 {getDaysDifference(assign.date)} 天
                                                 </span>
                                                 <span className="text-xs text-gray-400">{assign.date}</span>
                                             </div>
@@ -687,34 +767,36 @@ export default function App() {
 
                                     {/* 狀態數據條 */}
                                     <div className="px-4 py-2 bg-gray-50/50 border-b flex justify-between items-center text-xs">
-                                        <div className="flex gap-4">
+                                        <div className="flex flex-wrap gap-4">
                                             <span className="text-green-600 font-bold">完成：{stats.completed}</span>
                                             <span className="text-orange-500 font-bold">訂正：{stats.correction}</span>
                                             <span className="text-blue-500 font-bold">已繳：{stats.submitted}</span>
                                             <span className="text-teal-600 font-bold">免寫：{stats.exempt}</span>
+                                            <span className="text-purple-600 font-bold">請假：{stats.leave}</span>
                                             <span className="text-red-500 font-bold">未繳：{stats.missing}</span>
                                         </div>
                                         <div className="text-gray-400">共 {assignmentSubs.length} 人</div>
                                     </div>
 
-                                    {/* 學生名塊列表 (僅篩選出當前工作流關注的座號，加速點收) */}
+                                    {/* 學生名塊列表 */}
                                     <div className="p-3">
                                         <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-8 gap-2">
                                             {assignmentSubs.map(sub => {
                                                 const config = STATUS_CONFIG[sub.status];
                                                 const isExempt = sub.status === 'exempt';
+                                                const isLeave = sub.status === 'leave';
 
                                                 // 根據不同工作流階段，突出顯示或隱藏已完成的卡片，提高操作注意力
                                                 let isHighlighted = false;
                                                 if (activeWorkflowDay === 2 && sub.status === 'missing') isHighlighted = true;
                                                 if (activeWorkflowDay === 3 && (sub.status === 'missing' || sub.status === 'submitted')) isHighlighted = true;
-                                                if (activeWorkflowDay === 7 && sub.status !== 'completed' && sub.status !== 'exempt') isHighlighted = true;
+                                                if (activeWorkflowDay === 7 && sub.status !== 'completed' && sub.status !== 'exempt' && sub.status !== 'leave') isHighlighted = true;
 
                                                 return (
                                                     <div 
                                                         key={sub.id}
                                                         onClick={() => handleCycleStatus(sub)}
-                                                        className={`p-2 rounded-lg text-center border-2 transition-all select-none ${isExempt ? '' : 'cursor-pointer hover:shadow active:scale-95'} ${isHighlighted ? 'ring-2 ring-red-400 ring-offset-1 font-extrabold' : ''} ${config.cardColor} ${config.borderColor}`}
+                                                        className={`p-2 rounded-lg text-center border-2 transition-all select-none ${isExempt || isLeave ? 'bg-gray-100' : 'cursor-pointer hover:shadow active:scale-95'} ${isHighlighted ? 'ring-2 ring-red-400 ring-offset-1 font-extrabold' : ''} ${config.cardColor} ${config.borderColor}`}
                                                     >
                                                         <div className="flex flex-col items-center justify-center">
                                                             <span className="text-base font-bold font-mono text-gray-800 leading-tight">{sub.studentNumber}</span>
@@ -760,6 +842,7 @@ export default function App() {
                             <div className="px-2"><div className="text-lg font-bold text-orange-500 leading-tight">{currentAssignmentStats.correction}</div><div className="text-[10px] text-gray-500">訂正</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-blue-500 leading-tight">{currentAssignmentStats.submitted}</div><div className="text-[10px] text-gray-500">已繳</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-teal-600 leading-tight">{currentAssignmentStats.exempt}</div><div className="text-[10px] text-gray-500">免寫</div></div>
+                            <div className="px-2"><div className="text-lg font-bold text-purple-600 leading-tight">{currentAssignmentStats.leave}</div><div className="text-[10px] text-gray-500">請假</div></div>
                             <div className="px-2"><div className="text-lg font-bold text-gray-400 leading-tight">{currentAssignmentStats.missing}</div><div className="text-[10px] text-gray-500">未繳</div></div>
                         </div>
                     )}
@@ -767,6 +850,7 @@ export default function App() {
 
                 {selectedAssignmentId && assignments.length > 0 ? (
                     <>
+                        {/* 手機版：增加獨立免寫與請假按鈕 */}
                         <div className="block sm:hidden bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden print:hidden">
                              <table className="w-full text-sm text-left">
                                 <thead className="bg-gray-50 text-gray-500 font-medium"><tr><th className="px-4 py-2 w-16">座號</th><th className="px-4 py-2 text-right">狀態 (點擊切換)</th></tr></thead>
@@ -775,12 +859,13 @@ export default function App() {
                                     const config = STATUS_CONFIG[sub.status];
                                     const borderColor = config.borderColor.replace('border-', 'bg-');
                                     const isExempt = sub.status === 'exempt';
+                                    const isLeave = sub.status === 'leave';
                                     
                                     return (
                                     <tr 
                                         key={sub.id} 
                                         onClick={() => handleCycleStatus(sub)} 
-                                        className={`relative select-none transition-colors ${isExempt ? 'bg-teal-50/55' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
+                                        className={`relative select-none transition-colors ${isExempt ? 'bg-teal-50/55' : isLeave ? 'bg-purple-50/55' : 'hover:bg-gray-50 active:bg-gray-100 cursor-pointer'}`}
                                     >
                                         <td className="relative px-4 py-3 font-mono text-xl font-bold text-gray-700">
                                             <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${borderColor}`}></div>
@@ -788,6 +873,15 @@ export default function App() {
                                         </td>
                                         <td className="px-4 py-3 text-right">
                                             <div className="flex justify-end items-center gap-2">
+                                                {/* 獨立請假按鈕 */}
+                                                <button 
+                                                    onClick={(e) => toggleLeaveStatus(sub, e)}
+                                                    className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer pointer-events-auto ${isLeave ? 'bg-purple-100 border-purple-500 text-purple-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
+                                                    title="切換請假狀態"
+                                                >
+                                                    <Calendar size={22} strokeWidth={2.5}/>
+                                                </button>
+                                                {/* 獨立免寫按鈕 */}
                                                 <button 
                                                     onClick={(e) => toggleExemptStatus(sub, e)}
                                                     className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-teal-100 border-teal-500 text-teal-700 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-50'}`}
@@ -795,6 +889,7 @@ export default function App() {
                                                 >
                                                     <Ban size={22} strokeWidth={2.5}/>
                                                 </button>
+                                                {/* 狀態標籤 */}
                                                 <div className="flex-1 pointer-events-none">
                                                     <StatusBadge status={sub.status} isMobile={true} />
                                                 </div>
@@ -806,20 +901,31 @@ export default function App() {
                              </table>
                         </div>
                         
+                        {/* 桌面/平板版：座號卡片，增加獨立請假與免寫小按鈕 */}
                         <div className="hidden sm:grid grid-cols-5 gap-2 sm:gap-3 print:hidden">
                             {currentAssignmentSubmissions?.map(sub => {
                                 const config = STATUS_CONFIG[sub.status];
                                 const isExempt = sub.status === 'exempt';
+                                const isLeave = sub.status === 'leave';
                                 
                                 return (
                                 <div 
                                     key={sub.id} 
                                     onClick={() => handleCycleStatus(sub)}
-                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all select-none ${config.cardColor} ${config.borderColor} ${isExempt ? '' : 'cursor-pointer hover:shadow-md active:scale-95'}`}
+                                    className={`px-3 py-2 rounded-lg shadow-sm flex flex-col justify-center border-2 transition-all select-none ${config.cardColor} ${config.borderColor} ${isExempt || isLeave ? '' : 'cursor-pointer hover:shadow-md active:scale-95'}`}
                                 >
                                     <div className="flex justify-between items-center w-full">
                                         <span className="text-xl sm:text-2xl font-bold font-mono text-gray-800 tracking-tighter">{sub.studentNumber}</span>
                                         <div className="flex items-center gap-1.5">
+                                            {/* 獨立請假按鈕 */}
+                                            <button 
+                                                onClick={(e) => toggleLeaveStatus(sub, e)}
+                                                className={`p-1.5 rounded-md border transition-all cursor-pointer pointer-events-auto ${isLeave ? 'bg-purple-200 border-purple-500 text-purple-800 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
+                                                title="切換請假狀態"
+                                            >
+                                                <Calendar size={14} strokeWidth={3}/>
+                                            </button>
+                                            {/* 獨立免寫按鈕 */}
                                             <button 
                                                 onClick={(e) => toggleExemptStatus(sub, e)}
                                                 className={`p-1.5 rounded-md border transition-all cursor-pointer pointer-events-auto ${isExempt ? 'bg-teal-200 border-teal-500 text-teal-800 shadow-inner' : 'bg-white border-gray-200 text-gray-300 hover:bg-gray-100 hover:text-gray-500'}`}
@@ -924,26 +1030,27 @@ export default function App() {
                                     </td>
                                     {selectedExportAssignsSorted?.map(a => {
                                         const sub = submissions[`${a.id}_${student.id}`];
-                                        const simpleLabel = sub?.status === 'completed' ? 'O' : sub?.status === 'correction' ? '△' : sub?.status === 'submitted' ? 'V' : sub?.status === 'exempt' ? '-' : '';
+                                        const simpleLabel = sub?.status === 'completed' ? 'O' : sub?.status === 'correction' ? '△' : sub?.status === 'submitted' ? 'V' : sub?.status === 'exempt' ? '-' : sub?.status === 'leave' ? '請' : '';
                                         return <td key={a.id} className={`border border-gray-300 p-2 font-bold ${sub ? STATUS_CONFIG[sub.status].printColor : ''}`}>{simpleLabel}</td>;
                                     })}
                                 </tr>
                             ))}
                         </tbody>
                     </table>
-                    <div className="mt-4 text-xs text-gray-500 flex gap-4">
+                    <div className="mt-4 text-xs text-gray-500 flex flex-wrap gap-4">
                         <span>圖例說明：</span>
                         <span>O = 完成</span>
                         <span>△ = 訂正</span>
                         <span>V = 已繳</span>
                         <span>- = 免寫</span>
+                        <span>請 = 請假</span>
                         <span>(空) = 未繳 / 無紀錄</span>
                     </div>
                 </div>
             </div>
         )}
 
-        {/* VIEW 4: MANAGE */}
+        {/* VIEW 4: MANAGE (已強化安全渲染 + 加入放假日雲端管理) */}
         {activeTab === 'manage' && (
             <div className="space-y-6 print:hidden">
                 {selectedClassId && (
@@ -955,7 +1062,7 @@ export default function App() {
                 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     {/* 班級管理 */}
-                    <div className="lg:col-span-3 bg-white p-6 rounded-xl shadow-sm border border-gray-200">
+                    <div className="lg:col-span-2 bg-white p-6 rounded-xl shadow-sm border border-gray-200">
                         <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2 border-b pb-2"><Users size={20} className="text-indigo-600"/> 班級管理</h2>
                         <div className="flex flex-col sm:flex-row gap-4 items-end mb-4">
                             <div className="flex-grow w-full">
@@ -974,6 +1081,45 @@ export default function App() {
                         </div>
                     </div>
 
+                    {/* 【全新功能】放假日管理區塊 (lg:col-span-1) */}
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col">
+                        <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2 border-b pb-2">
+                            <Calendar size={20} className="text-indigo-600"/> 放假日管理 (排除催繳)
+                        </h2>
+                        <form onSubmit={handleAddHoliday} className="space-y-3 mb-4">
+                            <div>
+                                <label className="block text-xs font-semibold text-gray-500 mb-1">放假日期</label>
+                                <input type="date" required value={newHolidayDate} onChange={(e) => setNewHolidayDate(e.target.value)} className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <div>
+                                <label className="block text-xs font-semibold text-gray-500 mb-1">假期名稱</label>
+                                <input type="text" placeholder="例如：端午節" value={newHolidayName} onChange={(e) => setNewHolidayName(e.target.value)} className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 rounded-lg text-sm transition-all flex items-center justify-center gap-1">
+                                <Plus size={16}/> 新增放假日
+                            </button>
+                        </form>
+                        
+                        {/* 放假日列表 */}
+                        <div className="flex-grow overflow-y-auto max-h-48 border border-gray-100 rounded-lg bg-gray-50 p-2 space-y-1.5">
+                            {Object.keys(holidays).length === 0 ? (
+                                <div className="text-gray-400 text-xs text-center py-4">無自訂放假紀錄</div>
+                            ) : (
+                                Object.entries(holidays).sort((a,b) => a[0].localeCompare(b[0])).map(([dateKey, name]) => (
+                                    <div key={dateKey} className="flex justify-between items-center bg-white p-2 rounded-md border text-xs">
+                                        <div>
+                                            <span className="font-bold text-gray-800">{dateKey}</span>
+                                            <span className="text-gray-500 ml-1.5">({name})</span>
+                                        </div>
+                                        <button onClick={() => handleDeleteHoliday(dateKey)} className="text-red-400 hover:text-red-600">
+                                            <X size={14}/>
+                                        </button>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
                     {selectedClassId && (
                         <>
                         {/* 作業管理 */}
@@ -987,7 +1133,8 @@ export default function App() {
                             <div className="flex-grow overflow-y-auto pr-2 space-y-2">
                                 {assignments?.map(a => {
                                     const status = getAssignmentCompletion(a.id);
-                                    const percent = Math.round((status.completed / (status.total || 1)) * 100);
+                                    const totalForCalc = status.total || 1;
+                                    const percent = Math.round((status.completed / totalForCalc) * 100) || 0;
                                     return (
                                         <div key={a.id} className={`flex justify-between items-center p-3 rounded-lg border ${status.isDone ? 'bg-green-50 border-green-200' : 'bg-white border-gray-200'}`}>
                                             <div className="flex items-center gap-3">
